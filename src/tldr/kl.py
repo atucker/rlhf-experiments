@@ -53,7 +53,7 @@ class RewardHParams:
 @dataclass
 class PpoHParams:
     num_updates: tyro.conf.Suppress[int] = None
-    noptepochs: int = 4
+    noptepochs: int = 1
     vf_coef: float = 0.1
     cliprange: float = 0.2
     cliprange_value: float = 0.2
@@ -83,7 +83,7 @@ class TaskHParams:
 @dataclass
 class Args:
     # common args
-    exp_name: str = "pythia_ppo"
+    exp_name: str = "pythia_ipa"
     """the name of this experiment"""
     seed: int = 555134
     """seed of the experiment"""
@@ -588,13 +588,8 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
     stats_shape = (args.ppo.noptepochs, args.gradient_accumulation_steps)
-    approxkl_stats = torch.zeros(stats_shape, device=device)
-    pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
-    pg_loss_stats = torch.zeros(stats_shape, device=device)
-    vf_loss_stats = torch.zeros(stats_shape, device=device)
-    vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
-    entropy_stats = torch.zeros(stats_shape, device=device)
-    ratio_stats = torch.zeros(stats_shape, device=device)
+    loss_stats = torch.zeros(stats_shape, device=device)
+
     model.train()
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.batch_size
@@ -750,32 +745,9 @@ if __name__ == "__main__":
             actual_end = sequence_lengths
             rewards[[actual_start, actual_end]] += scores
 
-            """
-            # 5. whiten rewards
-            if args.ppo.whiten_rewards:
-                rewards = whiten(rewards, shift_mean=False)
-
-            # 6. compute advantages and returns
-            lastgaelam = 0
-            advantages_reversed = []
-            gen_length = args.task.response_length
-            for t in reversed(range(gen_length)):
-                nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
-                lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
-                advantages_reversed.append(lastgaelam)
-            advantages = torch.stack(advantages_reversed[::-1], axis=1)
-            returns = advantages + values
-            advantages = whiten(advantages)
-            return_mean, return_var = returns.mean(), returns.var()
-            value_mean, value_var = values.mean(), values.var()
-            writer.add_histogram("rewards", rewards[0].float(), global_step)
-            writer.add_histogram("advantages", advantages[0].float(), global_step)
-            accelerator.print("rewards====", rewards[0])
-            accelerator.print("advantages====", advantages[0])
-            """
             torch.cuda.empty_cache()
 
+        center = 0.1 * torch.mean(torch.sum(non_score_reward, axis=1) + scores)
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(args.local_batch_size)
@@ -784,72 +756,44 @@ if __name__ == "__main__":
                 mini_batch_end = mini_batch_start + args.per_device_train_batch_size
                 mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
                 with accelerator.accumulate(policy):
-                    """
-                    mb_return = returns[mini_batch_inds]
-                    mb_advantage = advantages[mini_batch_inds]
-                    mb_values = values[mini_batch_inds]
+                    # These are all fixed and won't get gradients
                     mb_responses = responses[mini_batch_inds]
                     mb_query_responses = query_responses[mini_batch_inds]
-                    mb_logprobs = logprobs[mini_batch_inds]
+                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1)
+                    mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
+                    mb_reward = scores[mini_batch_inds]
 
+                    # compute the logprobs w/ gradient tracking
                     output, vpred_temp = forward(model, mb_query_responses, tokenizer)
                     logits = output.logits[:, context_length - 1 : -1]
                     logits /= args.task.temperature + 1e-7
                     new_all_logprobs = F.log_softmax(logits, dim=-1)
-                    new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                    vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
-                    vpredclipped = torch.clamp(
-                        vpred,
-                        mb_values - args.ppo.cliprange_value,
-                        mb_values + args.ppo.cliprange_value,
+                    new_logprobs = torch.sum(
+                        torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
                     )
-                    vf_losses1 = torch.square(vpred - mb_return)
-                    vf_losses2 = torch.square(vpredclipped - mb_return)
-                    vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
-                    vf_clipfrac = (vf_losses2 > vf_losses1).float().mean()
-                    logprobs_diff = new_logprobs - mb_logprobs
-                    ratio = torch.exp(logprobs_diff)
-                    pg_losses = -mb_advantage * ratio
-                    pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
-                    pg_loss = torch.max(pg_losses, pg_losses2).mean()
-                    loss = pg_loss + args.ppo.vf_coef * vf_loss
+
+                    # the IPS trick loss
+                    approx_kl = new_logprobs - mb_ref_logprobs
+                    loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
+
+                    # RLOO loss
+                    #approx_kl = mb_logprobs - mb_ref_logprobs
+                    #loss = torch.mean(-1*new_logprobs * (mb_reward - kl_ctl.value * approx_kl))
+
                     accelerator.backward(loss)
-                    """
-                    optimizer.step()
-                    optimizer.zero_grad()
+
+                    if gradient_accumulation_idx % args.gradient_accumulation_steps == 0:
+                        #accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
                     with torch.no_grad():
-                        """
-                        pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
-                        prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                        approxkl = 0.5 * (logprobs_diff**2).mean()
-                        approxkl_stats[ppo_epoch_idx, gradient_accumulation_idx] = approxkl
-                        pg_clipfrac_stats[ppo_epoch_idx, gradient_accumulation_idx] = pg_clipfrac
-                        pg_loss_stats[ppo_epoch_idx, gradient_accumulation_idx] = pg_loss
-                        vf_loss_stats[ppo_epoch_idx, gradient_accumulation_idx] = vf_loss
-                        vf_clipfrac_stats[ppo_epoch_idx, gradient_accumulation_idx] = vf_clipfrac
-                        entropy_stats[ppo_epoch_idx, gradient_accumulation_idx] = entropy.mean()
-                        ratio_stats[ppo_epoch_idx, gradient_accumulation_idx] = ratio.mean()
-                        """
+                        # Do whatever logging we want
+                        loss_stats[ppo_epoch_idx, gradient_accumulation_idx] = loss.detach()
+                    
                 gradient_accumulation_idx += 1
-            if accelerator.is_main_process:
-                """
-                console.print(
-                    f"ppo_epoch_idx",
-                    ppo_epoch_idx,
-                    "approxkl",
-                    approxkl_stats[ppo_epoch_idx].mean().item(),
-                    "pg_loss",
-                    pg_loss_stats[ppo_epoch_idx].mean().item(),
-                    "pg_clipfrac",
-                    pg_clipfrac_stats[ppo_epoch_idx].mean().item(),
-                    "ratio",
-                    ratio_stats[ppo_epoch_idx].mean().item(),
-                )
-                """
 
         with torch.no_grad():
-    
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
             mean_non_score_reward = non_score_reward.sum(1).mean()
@@ -864,37 +808,9 @@ if __name__ == "__main__":
             writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
 
-            """
-            writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
-            writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
-            writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
-            writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
-            writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
-            writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
-            writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkl_stats).mean().item(), update)
-            writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(pg_clipfrac_stats).mean().item(), update)
-            writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_loss_stats).mean().item(), update)
-            writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_loss_stats).mean().item(), update)
-            writer.add_scalar("ppo/val/clipfrac_avg", accelerator.gather(vf_clipfrac_stats).mean().item(), update)
-            writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropy_stats).mean().item(), update)
-            writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
-            writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
-            writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/error", accelerator.gather(vf_losses1.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_clipfrac).mean().item(), update)
-            writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update)
-            writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update)
-            writer.add_scalar("ppo/val/ratio", accelerator.gather(ratio_stats).mean().item(), update)
-            writer.add_scalar("ppo/val/ratio_var", accelerator.gather(ratio_stats).var().item(), update)
-            writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/advantage_var", accelerator.gather(advantages.mean()).var().item(), update)
-            writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
-            writer.add_scalar("ppo/lr", lrnow, update)
-            writer.add_scalar("ppo/episode", global_step, update)
-            eps = int(global_step / (time.time() - start_time))
-            writer.add_scalar("ppo/eps", eps, update)
-            accelerator.print("ppo/eps", eps, update)
-            """
+            writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
+            writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
+            writer.add_scalar("train/loss", accelerator.gather(loss_stats).mean().item(), update)
 
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)

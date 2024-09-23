@@ -53,7 +53,7 @@ class RewardHParams:
 @dataclass
 class PpoHParams:
     num_updates: tyro.conf.Suppress[int] = None
-    noptepochs: int = 4
+    noptepochs: int = 1
     vf_coef: float = 0.1
     cliprange: float = 0.2
     cliprange_value: float = 0.2
@@ -83,7 +83,7 @@ class TaskHParams:
 @dataclass
 class Args:
     # common args
-    exp_name: str = "pythia_ppo"
+    exp_name: str = "pythia_ppo_1epoch"
     """the name of this experiment"""
     seed: int = 555134
     """seed of the experiment"""
