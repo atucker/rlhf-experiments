@@ -204,6 +204,7 @@ class AdaptiveKLController:
 
 def whiten(values, shift_mean=True):
     # `unbiased=False` matches TF `tf.nn.moments`'s setting
+    # Normalize the values to have a mean of 0 (if shift_mean is false) and a variance of 1
     mean, var = torch.mean(values), torch.var(values, unbiased=False)
     whitened = (values - mean) * torch.rsqrt(var + 1e-8)
     if not shift_mean:

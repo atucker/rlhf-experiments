@@ -3,8 +3,8 @@ import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
-from types import SimpleNamespace
-from typing import List, Literal, Optional
+from types import SimpleNamespace # like dataclasses but without the boilerplate
+from typing import List, Literal, Optional, Union
 import wandb
 
 import evaluate as hf_evaluate
@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
-import tyro
+import tyro # Library for generating CLI interfaces
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 from accelerate.utils import gather_object
@@ -20,7 +20,7 @@ from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
-from torch import optim
+
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -31,12 +31,12 @@ from transformers import (
     AutoTokenizer,
     GenerationConfig,
     PreTrainedModel,
+    PreTrainedTokenizer,
     get_scheduler,
 )
 
 from peft import get_peft_model, LoraConfig
 rouge = hf_evaluate.load("rouge")
-
 
 @dataclass
 class TaskHParams:
@@ -53,7 +53,6 @@ class TaskHParams:
 
     # LM params
     temperature: float = 0.01
-
 
 @dataclass
 class Args:
@@ -131,7 +130,10 @@ class Args:
 
 
 # taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
-def configure_dropout(model_config, dropout_layer_keys, dropout):
+def configure_dropout(model_config, dropout_layer_keys: List, dropout: Union[float, None]):
+    """
+    Set the dropout rate for the specified layers in the model configuration.
+    """
     if dropout is not None:
         for key in dropout_layer_keys:
             if hasattr(model_config, key):
@@ -140,6 +142,9 @@ def configure_dropout(model_config, dropout_layer_keys, dropout):
 
 
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
+    """
+    Formats a pandas DataFrame as a rich table and prints it to the console.
+    """
     table = Table(show_lines=True)
     for column in df.columns:
         table.add_column(column)
@@ -149,7 +154,8 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     console.print(table)
 
 
-def generate(lm_backbone, queries, tokenizer, generation_config):
+def generate(lm_backbone: PreTrainedModel, queries: torch.Tensor, 
+             tokenizer: PreTrainedTokenizer, generation_config: GenerationConfig):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
@@ -164,7 +170,7 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def first_true_indices(bools, dtype=torch.long):
+def first_true_indices(bools: torch.Tensor, dtype=torch.long) -> torch.Tensor:
     """
     Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
     the position of the first True in each "row".
@@ -176,7 +182,10 @@ def first_true_indices(bools, dtype=torch.long):
     return torch.min(zero_or_index, dim=-1).values
 
 
-def truncate_response(args, tokenizer, responses):
+def truncate_response(args: dict, tokenizer: PreTrainedTokenizer, responses: torch.Tensor) -> torch.Tensor:
+    """
+    Truncate the response after the first occurrence of the `truncate_token_id` token. Essentially terminates the response after the EOS token.
+    """
     trunc_idxs = first_true_indices(responses == args.task.truncate_token_id).unsqueeze(-1)
     new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
     idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
@@ -184,7 +193,7 @@ def truncate_response(args, tokenizer, responses):
     return postprocessed_responses
 
 
-def forward(model, query_responses, tokenizer):
+def forward(model: PreTrainedModel, query_responses: torch.Tensor, tokenizer: PreTrainedTokenizer) -> torch.Tensor:
     attention_mask = query_responses != tokenizer.pad_token_id
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     return model(
@@ -194,7 +203,12 @@ def forward(model, query_responses, tokenizer):
     )
 
 
-def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_config):
+def evaluate(args: Args, accelerator: Accelerator, tokenizer: PreTrainedTokenizer, 
+             model: PreTrainedModel, dataloader: DataLoader, generation_config: GenerationConfig) -> tuple[pd.DataFrame, dict, list]:
+    """
+    Evaluate the model on the validation dataset.
+    """
+    
     model.eval()
     rouge_scores = collections.defaultdict(list)
     all_decode_queries = []
