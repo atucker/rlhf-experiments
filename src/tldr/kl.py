@@ -42,13 +42,11 @@ class AdaptiveKLParams:
     target: float = 6.0
     horizon: int = 10000  # in episodes
 
-
 @dataclass
 class RewardHParams:
     use_adaptive_kl: bool = False
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
     kl_coef: float = 0.05
-
 
 @dataclass
 class PpoHParams:
@@ -182,7 +180,6 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
         table.add_row(*row.astype(str).tolist())
     console.rule(f"[bold red]{title}")
     console.print(table)
-
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.normal_(layer.weight, std=std)

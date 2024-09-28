@@ -59,7 +59,7 @@ class Args:
     # common args
     exp_name: str = "pythia_SFT"
     """the name of this experiment"""
-    seed: int = 555134
+    seed: int = 55513
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
@@ -73,7 +73,7 @@ class Args:
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
-    deepspeed: bool = True
+    deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
     run_eval: bool = True
     """Whether to run evaluation"""
@@ -92,15 +92,15 @@ class Args:
 
     num_train_epochs: int = 1
     """Number of epochs to train"""
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 2
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 2
+    per_device_train_batch_size: int = 8
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 2
+    per_device_eval_batch_size: int = 16
     """per rank eval batch size"""
 
     # optional args filled hilw running
-    world_size: Optional[int] = 4
+    world_size: Optional[int] = 3
     """The number of processes (GPUs) to use"""
     num_updates: Optional[int] = None
     """The number of updates to train"""
@@ -110,9 +110,9 @@ class Args:
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
 
     # other args
-    base_model: str = "EleutherAI/pythia-1.4b-deduped"
+    base_model: str = "EleutherAI/pythia-410m-deduped"
     """the name of the pretrained model to use"""
-    output_dir: str = "models/sft_tldr_pythia_1_4b"
+    output_dir: str = "models/sft_tldr_pythia_1_410m"
     """Where to save the model"""
     lora: bool = False
     """Whether to use lora"""
@@ -125,6 +125,7 @@ class Args:
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
+    amp: Optional[str] = "bf16"
     """Which layers to apply dropout to"""
     task: TaskHParams = field(default_factory=TaskHParams)
 
@@ -208,7 +209,7 @@ def evaluate(args: Args, accelerator: Accelerator, tokenizer: PreTrainedTokenize
     """
     Evaluate the model on the validation dataset.
     """
-    
+
     model.eval()
     rouge_scores = collections.defaultdict(list)
     all_decode_queries = []
@@ -280,7 +281,8 @@ def evaluate(args: Args, accelerator: Accelerator, tokenizer: PreTrainedTokenize
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
+                              mixed_precision = args.amp,)
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
     
     random.seed(local_seed)
