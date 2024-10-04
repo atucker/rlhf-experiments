@@ -83,7 +83,7 @@ class Args:
     # common args
     exp_name: str = "pythia_ipa"
     """the name of this experiment"""
-    seed: int = 555134
+    seed: int = 55134
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
@@ -97,9 +97,9 @@ class Args:
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
-    deepspeed: bool = True
+    deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 100
+    print_sample_output_freq: int = 1000
     """How often to print sample output"""
     run_eval: bool = True
     """Whether to run evaluation"""
@@ -118,39 +118,39 @@ class Args:
 
     num_train_epochs: int = 1
     """Number of epochs to train"""
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = 10
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 2
+    per_device_train_batch_size: int = 6
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 2
+    per_device_eval_batch_size: int = 6
     """per rank eval batch size"""
-    total_episodes: int = 1000000
+    total_episodes: int = int(1e5) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
-    world_size: Optional[int] = 8
+    world_size: Optional[int] = 3
     """The number of processes (GPUs) to use"""
     batch_size: Optional[int] = 512
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
-    local_rollout_forward_batch_size: int = 32
+    local_rollout_forward_batch_size: int = 8
     """per rank no grad forward pass in the rollout phase"""
-    local_batch_size: Optional[int] = 128
+    local_batch_size: Optional[int] = 128 # Doesn't do anything
     """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
 
     # other args
-    base_model: str = "models/sft_tldr_pythia_1_4b"
+    base_model: str = "models/sft_tldr_pythia_410m"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
-    reward_model_path: str = "models/rm_sft_tldr_pythia_1_4b"
+    reward_model_path: str = "models/rm_sft_tldr_pythia_410m"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "models/sft_tldr_pythia_1_4b"
+    sft_model_path: str = "models/sft_tldr_pythia_410m"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
     """Which layers to apply dropout to"""
-    output_dir: str = "models/ppo_tldr_pythia_1_4b"
+    output_dir: str = "models/ppo_tldr_pythia_410m"
     """Where to save the model"""
     lora_rank: int = 1024
     """the rank of the lora matrix"""
