@@ -112,7 +112,7 @@ class Args:
     # other args
     base_model: str = "EleutherAI/pythia-410m-deduped"
     """the name of the pretrained model to use"""
-    output_dir: str = "models/sft_tldr_pythia_1_410m"
+    output_dir: str = "models/sft_tldr_pythia_410m"
     """Where to save the model"""
     lora: bool = False
     """Whether to use lora"""
