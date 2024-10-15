@@ -56,7 +56,7 @@ class Args:
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "tldr_summarize_pythia"
+    wandb_project_name: str = "tldr_summarize_pythia_will"
     """the wandb's project name"""
     cuda: bool = True
     """Whether to use cuda if available."""
@@ -85,7 +85,7 @@ class Args:
 
     num_train_epochs: int = 1
     """Number of epochs to train"""
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4
     """The number of gradient accumulation steps"""
     per_device_train_batch_size: int = 8
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
@@ -93,14 +93,12 @@ class Args:
     """per rank eval batch size"""
 
     # optional args filled while running
-    world_size: Optional[int] = 3
+    world_size: Optional[int] = 8
     """The number of processes (GPUs) to use"""
     num_updates: Optional[int] = None
     """The number of updates to train"""
     total_episodes: Optional[int] = None
     """The total number of episodes in the dataset"""
-    batch_size: Optional[int] = 64
-    """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
 
     # other args
     base_model: str = "./models/sft_tldr_pythia_410m"
@@ -432,6 +430,7 @@ if __name__ == "__main__":
             del evaluate_df
             torch.cuda.empty_cache()
 
+    # Calculate mean, std, and range of reference responses in order to normalize reward model outputs
     norm_dataset = load_dataset(args.task.query_dataset, split="train")
     norm_dataset = norm_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     norm_dataloader = DataLoader(norm_dataset, batch_size=args.per_device_eval_batch_size, shuffle=True)

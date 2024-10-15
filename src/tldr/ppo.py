@@ -92,7 +92,7 @@ class Args:
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "tldr_summarize_pythia"
+    wandb_project_name: str = "tldr_summarize_pythia_will"
     """the wandb's project name"""
     cuda: bool = True
     """Whether to use cuda if available."""
@@ -143,19 +143,19 @@ class Args:
     """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
 
     # other args
-    base_model: str = "models/sft_tldr_pythia_1_4b"
+    base_model: str = "models/sft_tldr_pythia_410m"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
-    reward_model_path: str = "models/rm_sft_tldr_pythia_1_4b"
+    reward_model_path: str = "models/rm_sft_tldr_pythia_410m"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "models/sft_tldr_pythia_1_4b"
+    sft_model_path: str = "models/sft_tldr_pythia_410m"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
     """Which layers to apply dropout to"""
-    output_dir: str = "models/ppo_tldr_pythia_1_4b"
+    output_dir: str = "models/ppo_tldr_pythia_410m"
     """Where to save the model"""
     lora_rank: int = 1024
     """the rank of the lora matrix"""

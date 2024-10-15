@@ -88,7 +88,7 @@ class Args:
     """seed of the experiment"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "tldr_summarize_pythia"
+    wandb_project_name: str = "tldr_summarize_pythia_will"
     """the wandb's project name"""
     cuda: bool = True
     """Whether to use cuda if available."""
@@ -129,7 +129,7 @@ class Args:
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
-    world_size: Optional[int] = 3
+    world_size: Optional[int] = 8
     """The number of processes (GPUs) to use"""
     batch_size: Optional[int] = 512
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
