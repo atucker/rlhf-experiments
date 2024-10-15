@@ -35,6 +35,7 @@ from transformers import (
     PreTrainedModel,
 )
 from peft import get_peft_model, LoraConfig
+from utils import set_seed
 
 
 @dataclass
@@ -424,16 +425,12 @@ def evaluate(args: Args, reward_model, policy, tokenizer, dataloader, generation
     )
     return eval_storage, eval_df
 
-
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
-
-    random.seed(local_seed)
-    np.random.seed(local_seed)
-    torch.manual_seed(local_seed)
+    set_seed(local_seed)
 
     args.world_size = accelerator.num_processes
     args.batch_size = args.per_device_train_batch_size * args.world_size * args.gradient_accumulation_steps

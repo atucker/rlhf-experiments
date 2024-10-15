@@ -39,6 +39,9 @@ from peft import get_peft_model, LoraConfig
 
 @dataclass
 class AdaptiveKLParams:
+    """
+    Adaptively modify the KL divergence penalty coefficient (beta) based on the current KL divergence value.
+    """
     target: float = 6.0
     horizon: int = 10000  # in episodes
 
@@ -53,13 +56,13 @@ class RewardHParams:
 @dataclass
 class PpoHParams:
     num_updates: tyro.conf.Suppress[int] = None
-    noptepochs: int = 1
-    vf_coef: float = 0.1
-    cliprange: float = 0.2
-    cliprange_value: float = 0.2
-    gamma: float = 1
-    lam: float = 0.95
-    whiten_rewards: bool = True
+    noptepochs: int = 1 # number of optimization epochs
+    vf_coef: float = 0.1 # coefficient for value function loss
+    cliprange: float = 0.2 # cliprange for ppo
+    cliprange_value: float = 0.2 # cliprange for value function
+    gamma: float = 1 # discount factor
+    lam: float = 0.95 # lambda for GAE
+    whiten_rewards: bool = True 
 
 
 @dataclass
