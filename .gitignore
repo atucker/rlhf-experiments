@@ -167,3 +167,4 @@ tensorboard/
 wandb/
 *.json
 *.bin
+*.zip
