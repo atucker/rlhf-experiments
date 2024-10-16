@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 import wandb
-import deepspeed
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 from accelerate.utils import gather_object
@@ -119,21 +118,19 @@ class Args:
 
     num_train_epochs: int = 1
     """Number of epochs to train"""
-    gradient_accumulation_steps: int = 10
+    gradient_accumulation_steps: int = 4
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 6
+    per_device_train_batch_size: int = 16
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 6
+    per_device_eval_batch_size: int = 16
     """per rank eval batch size"""
     total_episodes: int = int(1e5) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
-    world_size: Optional[int] = 8
+    world_size: Optional[int] = 2
     """The number of processes (GPUs) to use"""
-    batch_size: Optional[int] = 512
-    """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
-    local_rollout_forward_batch_size: int = 8
+    local_rollout_forward_batch_size: int = 16
     """per rank no grad forward pass in the rollout phase"""
     local_batch_size: Optional[int] = 128 # Doesn't do anything
     """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
@@ -538,25 +535,7 @@ if __name__ == "__main__":
     torch.manual_seed(local_seed)  # reset the local seed again
 
     if args.deepspeed:
-        deepspeed_states = AcceleratorState().deepspeed_plugin
-        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
-
-        eval_ds_config = {
-            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
-            "bf16": {"enabled": True},
-            "prescale_gradients": False,
-            "wall_clock_breakdown": False,
-        }
-        if args.offload or args.base_model == "EleutherAI/pythia-6.9b-deduped":
-            deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
-            eval_ds_config["zero_optimization"] = {
-                "stage": 3,
-                "stage3_param_persistence_threshold": 1e4,
-                "offload_param": {"device": "cpu"},
-            }
-        accelerator.print(f"{eval_ds_config=}")
-        reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
-        reward_model.eval()
+        raise NotImplementedError("DeepSpeed is not supported.")
     else:
         reward_model = reward_model.to(device)
 

@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 import wandb
-import deepspeed
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 from accelerate.utils import gather_object
@@ -102,7 +101,7 @@ class Args:
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
-    deepspeed: bool = True
+    deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 100
     """How often to print sample output"""
@@ -123,11 +122,11 @@ class Args:
 
     num_train_epochs: int = 1
     """Number of epochs to train"""
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 2
+    per_device_train_batch_size: int = 8
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 2
+    per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
     total_episodes: int = 1000000
     """The total number of episodes in the dataset"""
@@ -546,25 +545,7 @@ if __name__ == "__main__":
     torch.manual_seed(local_seed)  # reset the local seed again
 
     if args.deepspeed:
-        deepspeed_states = AcceleratorState().deepspeed_plugin
-        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
-
-        eval_ds_config = {
-            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
-            "bf16": {"enabled": True},
-            "prescale_gradients": False,
-            "wall_clock_breakdown": False,
-        }
-        if args.offload or args.base_model == "EleutherAI/pythia-6.9b-deduped":
-            deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
-            eval_ds_config["zero_optimization"] = {
-                "stage": 3,
-                "stage3_param_persistence_threshold": 1e4,
-                "offload_param": {"device": "cpu"},
-            }
-        accelerator.print(f"{eval_ds_config=}")
-        reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
-        reward_model.eval()
+        raise NotImplementedError("DeepSpeed is not supported right now (on devboxes)")
     else:
         reward_model = reward_model.to(device)
 

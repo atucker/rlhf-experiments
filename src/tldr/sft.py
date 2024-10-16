@@ -92,15 +92,15 @@ class Args:
 
     num_train_epochs: int = 1
     """Number of epochs to train"""
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 2
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 8
+    per_device_train_batch_size: int = 32
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 8
+    per_device_eval_batch_size: int = 32
     """per rank eval batch size"""
 
     # optional args filled hilw running
-    world_size: Optional[int] = 8
+    world_size: Optional[int] = 2
     """The number of processes (GPUs) to use"""
     num_updates: Optional[int] = None
     """The number of updates to train"""
