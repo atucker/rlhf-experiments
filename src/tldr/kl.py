@@ -51,7 +51,7 @@ class RewardHParams:
 @dataclass
 class PpoHParams:
     num_updates: tyro.conf.Suppress[int] = None
-    noptepochs: int = 1
+    noptepochs: int = 1 # number of epochs to train on each PPO update
     vf_coef: float = 0.1
     cliprange: float = 0.2
     cliprange_value: float = 0.2
@@ -246,7 +246,7 @@ class ScalarModel(PreTrainedModel):
 def get_reward(reward_model: nn.Module, query_responses: torch.Tensor, tokenizer: AutoTokenizer, context_length: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Uses the reward model to calculate reward information for the given query_responses.
-    
+
     Returns the logits, reward at the last token position in each sequence, and the sequence lengths.
     """
     attention_mask = query_responses != tokenizer.pad_token_id
@@ -272,6 +272,9 @@ def get_reward(reward_model: nn.Module, query_responses: torch.Tensor, tokenizer
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
+    """
+    A wrapper that fuses the model and its value function. Note that in this implementation the policy and value are both LORAs and share the same backbone.
+    """
     def __init__(self, policy, critic) -> None:
         super().__init__()
         self.policy = policy
@@ -288,8 +291,13 @@ def exact_div(a, b):
     return q
 
 
-def generate(lm_backbone, queries, tokenizer, generation_config):
-    """generate in a way that does not affect padding tokens"""
+def generate(lm_backbone: AutoModelForCausalLM, 
+             queries: torch.Tensor, 
+             tokenizer: AutoTokenizer, 
+             generation_config: GenerationConfig) -> torch.Tensor:
+    """
+    Generates in a way that does not affect padding tokens.
+    """
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
@@ -323,7 +331,14 @@ def truncate_response(args, tokenizer, responses):
     return postprocessed_responses
 
 
-def forward(model, query_responses, tokenizer, ref=False):
+def forward(model: AutoModelForCausalLM, 
+            query_responses: torch.Tensor, 
+            tokenizer: AutoTokenizer, 
+            ref: bool = False):
+    """
+    Get model output for given query_responses. 
+    If ref is True, the model's adapter module is disabled (e.g peft models are reverted to their base models).
+    """
     attention_mask = query_responses != tokenizer.pad_token_id
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     if ref:
@@ -341,7 +356,6 @@ def forward(model, query_responses, tokenizer, ref=False):
             return_dict=True,
             output_hidden_states=True,
         )
-
 
 @dataclass
 class EvalStorage:
@@ -367,29 +381,37 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
     with torch.no_grad():
         for data in tqdm(dataloader):
 
-            # 1. Extract queries and reference responses from the dataset.
+            # 1. Extract queries and reference responses from the dataset
             queries = data["query_token"]
             reference_response_token = data["reference_response_token"]
             context_length = queries.shape[1]
             query_reference_responses = torch.cat((data["query_token"], data["reference_response_token"]), dim=1)
+
+            # 2. Calculate the reference score (e.g the reward given to full reference sequences)
             _, reference_score, _ = get_reward(reward_model, query_reference_responses, tokenizer, queries.shape[1])
 
+            # 3. Generate responses using the given policy model
             query_responses = generate(
-                policy,
-                queries,
-                tokenizer,
-                generation_config,
+                lm_backbone = policy,
+                queries = queries,
+                tokenizer = tokenizer,
+                generation_config = generation_config,
             )
+
             responses = query_responses[:, context_length:]
-            
-            output = forward(policy, query_responses, tokenizer)
+            output = forward(model = policy, 
+                             query_responses = query_responses, 
+                             tokenizer = tokenizer)
             logits = output.logits[:, context_length - 1 : -1]
             logits /= generation_config.temperature
             all_logprob = F.log_softmax(logits, dim=-1)
+
+            # 4. Calculate logprobs for the policy-generated responses.
             logprobs = torch.gather(all_logprob, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprob
             torch.cuda.empty_cache()
 
+            # 5. Calculate logprobs under the reference model for the policy-generated responses
             ref_output = forward(policy, query_responses, tokenizer, ref=True)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
             ref_logits /= generation_config.temperature
@@ -572,7 +594,7 @@ if __name__ == "__main__":
     accelerator.print("===training policy===")
     global_step = 0
     start_time = time.time()
-    stats_shape = (args.ppo.noptepochs, args.gradient_accumulation_steps)
+    stats_shape = (args.ppo.noptepochs)
     loss_stats = torch.zeros(stats_shape, device=device)
 
     model.train()
@@ -736,7 +758,6 @@ if __name__ == "__main__":
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(args.local_batch_size)
-            gradient_accumulation_idx = 0
             for mini_batch_start in range(0, args.local_batch_size, args.per_device_train_batch_size):
                 mini_batch_end = mini_batch_start + args.per_device_train_batch_size
                 mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
@@ -766,18 +787,14 @@ if __name__ == "__main__":
                     #loss = torch.mean(-1*new_logprobs * (mb_reward - kl_ctl.value * approx_kl))
 
                     accelerator.backward(loss)
-
-                    if gradient_accumulation_idx % args.gradient_accumulation_steps == 0:
-                        #accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
+                    #accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
                     with torch.no_grad():
                         # Do whatever logging we want
-                        loss_stats[ppo_epoch_idx, gradient_accumulation_idx] = loss.detach()
+                        loss_stats[ppo_epoch_idx] += loss.detach() / args.gradient_accumulation_steps
                     
-                gradient_accumulation_idx += 1
-
         with torch.no_grad():
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
