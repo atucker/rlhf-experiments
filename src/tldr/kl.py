@@ -3,7 +3,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -120,9 +120,9 @@ class Args:
     """Number of epochs to train"""
     gradient_accumulation_steps: int = 4
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 16
+    per_device_train_batch_size: int = 8
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 16
+    per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
     total_episodes: int = int(1e5) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
@@ -130,10 +130,8 @@ class Args:
     # optional args filled while running
     world_size: Optional[int] = 2
     """The number of processes (GPUs) to use"""
-    local_rollout_forward_batch_size: int = 16
+    local_rollout_forward_batch_size: int = 8
     """per rank no grad forward pass in the rollout phase"""
-    local_batch_size: Optional[int] = 128 # Doesn't do anything
-    """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
 
     # other args
     base_model: str = "models/sft_tldr_pythia_410m"
@@ -148,7 +146,7 @@ class Args:
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
     """Which layers to apply dropout to"""
-    output_dir: str = "models/ppo_tldr_pythia_410m"
+    output_dir: str = "models/dips_tldr_pythia_410m"
     """Where to save the model"""
     lora_rank: int = 1024
     """the rank of the lora matrix"""
@@ -245,22 +243,28 @@ class ScalarModel(PreTrainedModel):
         return reward
 
 
-def get_reward(model, query_responses, tokenizer, context_length):
+def get_reward(reward_model: nn.Module, query_responses: torch.Tensor, tokenizer: AutoTokenizer, context_length: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Uses the reward model to calculate reward information for the given query_responses.
+    
+    Returns the logits, reward at the last token position in each sequence, and the sequence lengths.
+    """
     attention_mask = query_responses != tokenizer.pad_token_id
     # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits = model(
+    reward_logits = reward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         # position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
     )
+
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return (
         reward_logits,
-        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
+        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1), # reward at the last token position (e.g the final reward) in each sequence
         sequence_lengths,
     )
 
@@ -299,7 +303,7 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def first_true_indices(bools, dtype=torch.long):
+def first_true_indices(bools, dtype=torch.long) -> torch.Tensor:
     """
     Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
     the position of the first True in each "row".
@@ -341,6 +345,9 @@ def forward(model, query_responses, tokenizer, ref=False):
 
 @dataclass
 class EvalStorage:
+    """
+    Stores evaluation results from the reward model.
+    """
     query_token: List[str] = field(default_factory=list)
     postprocessed_response_token: List[str] = field(default_factory=list)
     reference_response_token: List[str] = field(default_factory=list)
@@ -353,10 +360,14 @@ class EvalStorage:
     kl: List[float] = field(default_factory=list)
 
 
-def evaluate(args: Args, reward_model, policy, tokenizer, dataloader, generation_config, sampling=True):
+def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: AutoTokenizer,
+             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True):
+
     eval_storage = EvalStorage()
     with torch.no_grad():
         for data in tqdm(dataloader):
+
+            # 1. Extract queries and reference responses from the dataset.
             queries = data["query_token"]
             reference_response_token = data["reference_response_token"]
             context_length = queries.shape[1]
@@ -567,8 +578,8 @@ if __name__ == "__main__":
     model.train()
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.batch_size
-        frac = 1.0 - (update - 1.0) / args.ppo.num_updates
-        lrnow = frac * args.lr
+        frac = 1.0 - ((update - 1.0) / args.ppo.num_updates)
+        lrnow = frac * args.lr # linear learning rate decay
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         with torch.no_grad():
