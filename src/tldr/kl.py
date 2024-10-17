@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 import wandb
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.state import AcceleratorState
 from accelerate.utils import gather_object
 from datasets import load_dataset
@@ -116,13 +116,11 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    num_train_epochs: int = 1
-    """Number of epochs to train"""
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 8
+    per_device_train_batch_size: int = 16
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 8
+    per_device_eval_batch_size: int = 16
     """per rank eval batch size"""
     total_episodes: int = int(1e5) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
@@ -130,7 +128,7 @@ class Args:
     # optional args filled while running
     world_size: Optional[int] = 2
     """The number of processes (GPUs) to use"""
-    local_rollout_forward_batch_size: int = 8
+    local_rollout_forward_batch_size: int = 16
     """per rank no grad forward pass in the rollout phase"""
 
     # other args
@@ -458,7 +456,9 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
+                              kwargs_handlers = [DistributedDataParallelKwargs(find_unused_parameters = True)]) 
+    #                           ^ Necessary for the policy-value wrapper trick we pull
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
     set_seed(local_seed)
 
@@ -641,7 +641,7 @@ if __name__ == "__main__":
                             wandb.log({f"eval/query_responses_{update}": wandb.Table(dataframe=eval_df)}, step=update)
 
                 # save model
-                if args.output_dir and args.num_train_epochs > 0:
+                if args.output_dir:
                     os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
                     time_tensor = torch.tensor([int(time.time())], device=device)
                     time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes
@@ -835,7 +835,7 @@ if __name__ == "__main__":
                 wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
 
     # save model
-    if args.output_dir and args.num_train_epochs > 0:
+    if args.output_dir:
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
         time_tensor = torch.tensor([int(time.time())], device=device)
         time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes
