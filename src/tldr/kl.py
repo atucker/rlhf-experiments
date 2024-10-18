@@ -80,8 +80,9 @@ class TaskHParams:
 
 @dataclass
 class Args:
+    train_dips: bool = False # whether to train via DIPS or RLOO
     # common args
-    exp_name: str = "pythia_ipa"
+    exp_name: str = "pythia"
     """the name of this experiment"""
     seed: int = 55134
     """seed of the experiment"""
@@ -105,8 +106,8 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-5
-    """the epsilon value for the optimizer"""
+    eps: float = 1e-8
+    """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
     lr: float = 3e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
@@ -116,7 +117,7 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4
     """The number of gradient accumulation steps"""
     per_device_train_batch_size: int = 16
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
@@ -144,7 +145,7 @@ class Args:
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
     """Which layers to apply dropout to"""
-    output_dir: str = "models/dips_tldr_pythia_410m"
+    output_dir: str = "models/tldr_pythia_410m"
     """Where to save the model"""
     lora_rank: int = 1024
     """the rank of the lora matrix"""
@@ -373,8 +374,13 @@ class EvalStorage:
 
 
 def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: AutoTokenizer,
-             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True):
-
+             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True) -> Tuple[EvalStorage, pd.DataFrame]:
+    """
+    Completes an episode rollout for the policy model and returns:
+    - reference response and reference response performance
+    - policy-generated response and policy-generated response performance
+    - kl divergence between the policy and reference model
+    """
     eval_storage = EvalStorage()
     with torch.no_grad():
         for data in tqdm(dataloader):
@@ -418,10 +424,12 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             del ref_output, ref_logits, ref_all_logprob
             torch.cuda.empty_cache()
 
+            # 6. Calculate KL divergence penalty
+            kl = (logprobs - ref_logprobs).sum(1)
+
             postprocessed_responses = truncate_response(args, tokenizer, responses)
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             _, score, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, queries.shape[1])
-            kl = (logprobs - ref_logprobs).sum(1)
 
             eval_storage.query_token.extend(queries)
             eval_storage.reference_response_token.extend(reference_response_token)
@@ -482,6 +490,14 @@ if __name__ == "__main__":
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     console = Console(force_terminal=True)
+
+    # Add train type annotation to the experiment name
+    if args.train_dips:
+        args.exp_name = f"{args.exp_name}_dips"
+        args.output_dir = f"{args.output_dir}_dips"
+    else:
+        args.exp_name = f"{args.exp_name}_rloo"
+        args.output_dir = f"{args.output_dir}_rloo"
     run_name = f"{args.exp_name}__{args.seed}__{args.output_dir.split('/')[1]}"
     writer = SimpleNamespace()  # dummy writer
     writer.add_scalar = lambda x, y, z: None
@@ -778,13 +794,15 @@ if __name__ == "__main__":
                         torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
                     )
 
-                    # the IPS trick loss
-                    approx_kl = new_logprobs - mb_ref_logprobs
-                    loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
+                    if args.train_dips:
+                        # the IPS trick loss
+                        approx_kl = new_logprobs - mb_ref_logprobs
+                        loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
 
-                    # RLOO loss
-                    #approx_kl = mb_logprobs - mb_ref_logprobs
-                    #loss = torch.mean(-1*new_logprobs * (mb_reward - kl_ctl.value * approx_kl))
+                    else:
+                        # RLOO loss
+                        approx_kl = mb_logprobs - mb_ref_logprobs
+                        loss = torch.mean(-1*new_logprobs * (mb_reward - kl_ctl.value * approx_kl))
 
                     accelerator.backward(loss)
                     #accelerator.clip_grad_norm_(model.parameters(), 1.0)
