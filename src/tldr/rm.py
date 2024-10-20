@@ -34,7 +34,7 @@ from transformers import (
     get_scheduler,
 )
 from peft import LoraConfig, get_peft_model
-
+wandb.login(key=os.environ["WANDB_API_KEY"])
 
 # a patch
 @dataclass

@@ -37,6 +37,7 @@ from transformers import (
 
 from peft import get_peft_model, LoraConfig
 rouge = hf_evaluate.load("rouge")
+wandb.login(key=os.environ["WANDB_API_KEY"])
 
 @dataclass
 class TaskHParams:

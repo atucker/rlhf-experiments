@@ -36,6 +36,7 @@ from transformers import (
 )
 from peft import get_peft_model, LoraConfig
 
+wandb.login(key=os.environ["WANDB_API_KEY"])
 
 @dataclass
 class AdaptiveKLParams:
