@@ -134,13 +134,13 @@ class Args:
     """per rank no grad forward pass in the rollout phase"""
 
     # other args
-    base_model: str = "models/sft_tldr_pythia_410m"
+    base_model: str = "models/sft_tldr_pythia_1_4b"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
-    reward_model_path: str = "models/rm_sft_tldr_pythia_410m"
+    reward_model_path: str = "models/rm_sft_tldr_pythia_1_4b"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "models/sft_tldr_pythia_410m"
+    sft_model_path: str = "models/sft_tldr_pythia_1_4b"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]

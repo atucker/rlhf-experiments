@@ -1,1 +1,1 @@
-accelerate launch --num_processes 8 --mixed-precision bf16 src/tldr/rm.py
+accelerate launch --num_processes 4 --mixed-precision bf16 src/tldr/rm.py

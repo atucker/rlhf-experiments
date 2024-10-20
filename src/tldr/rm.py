@@ -101,9 +101,9 @@ class Args:
     """The total number of episodes in the dataset"""
 
     # other args
-    base_model: str = "./models/sft_tldr_pythia_410m"
+    base_model: str = "./models/sft_tldr_pythia_1_4b"
     """the name of the pretrained model to use"""
-    output_dir: str = "models/rm_sft_tldr_pythia_410m"
+    output_dir: str = "models/rm_sft_tldr_pythia_1_4b"
     """Where to save the model"""
     lora: bool = False
     """Whether to use lora"""
