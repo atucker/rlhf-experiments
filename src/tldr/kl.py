@@ -130,7 +130,7 @@ class Args:
     # optional args filled while running
     world_size: Optional[int] = 2
     """The number of processes (GPUs) to use"""
-    local_rollout_forward_batch_size: int = 16
+    local_rollout_forward_batch_size: int = 4
     """per rank no grad forward pass in the rollout phase"""
 
     # other args
