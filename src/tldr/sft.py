@@ -109,7 +109,7 @@ class Args:
     """The total number of episodes in the dataset"""
 
     # other args
-    base_model: str = "EleutherAI/pythia-1_4b-deduped"
+    base_model: str = "EleutherAI/pythia-1.4b-deduped"
     """the name of the pretrained model to use"""
     output_dir: str = "models/sft_tldr_pythia_1_4b"
     """Where to save the model"""
