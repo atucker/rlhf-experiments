@@ -118,11 +118,11 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 16
+    per_device_train_batch_size: int = 4
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 16
+    per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
     total_episodes: int = int(1e5) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""

@@ -85,11 +85,11 @@ class Args:
 
     num_train_epochs: int = 1
     """Number of epochs to train"""
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 8
+    per_device_train_batch_size: int = 4
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 8
+    per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
 
     # optional args filled while running
