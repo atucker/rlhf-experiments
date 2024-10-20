@@ -17,5 +17,5 @@ zip_subfolders() {
     done
 }
 
-zip_subfolders()
-mv *.zip $2
+zip_subfolders
+find . -type f -name "*.zip" -exec mv {} $2 \;
