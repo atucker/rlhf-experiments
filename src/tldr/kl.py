@@ -799,7 +799,7 @@ if __name__ == "__main__":
                     if args.train_dips:
                         # the IPS trick loss
                         approx_kl = new_logprobs - mb_ref_logprobs
-                        loss = torch.mean(-1*(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
+                        loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
 
                     else:
                         # RLOO loss
