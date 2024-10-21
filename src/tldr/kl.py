@@ -109,7 +109,7 @@ class Args:
     # optimizer args
     eps: float = 1e-8
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 3e-6
+    lr: float = 1e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -118,13 +118,13 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 32
     """The number of gradient accumulation steps"""
     per_device_train_batch_size: int = 4
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
-    total_episodes: int = int(1e5) # Informs the number of ppo updates to do
+    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
@@ -146,7 +146,7 @@ class Args:
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
     """Which layers to apply dropout to"""
-    output_dir: str = "models/tldr_pythia_410m"
+    output_dir: str = "models/tldr_pythia_1_4b"
     """Where to save the model"""
     lora_rank: int = 1024
     """the rank of the lora matrix"""
@@ -780,25 +780,26 @@ if __name__ == "__main__":
                 mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
                 with accelerator.accumulate(policy):
                     # These are all fixed and won't get gradients
-                    mb_responses = responses[mini_batch_inds]
-                    mb_query_responses = query_responses[mini_batch_inds]
+                    mb_responses = responses[mini_batch_inds] # [batch_size, response_len]
+                    mb_query_responses = query_responses[mini_batch_inds] # [batch_size, seq_len]
                     mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1)
                     mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
                     mb_reward = scores[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
                     output, vpred_temp = forward(model, mb_query_responses, tokenizer)
-                    logits = output.logits[:, context_length - 1 : -1]
+                    # output.logits has shape [batch_size, seq_len, vocab_size]
+                    logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
                     logits /= args.task.temperature + 1e-7
-                    new_all_logprobs = F.log_softmax(logits, dim=-1)
-                    new_logprobs = torch.sum(
+                    new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
+                    new_logprobs = torch.sum( # index logprobs over vocab dim by what the model actually generated
                         torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
-                    )
+                    ) # shape [batch_size] (total logprob of the response)
 
                     if args.train_dips:
                         # the IPS trick loss
                         approx_kl = new_logprobs - mb_ref_logprobs
-                        loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
+                        loss = torch.mean(-1*(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
 
                     else:
                         # RLOO loss
