@@ -107,9 +107,9 @@ class Args:
     """Whether to run evaluation"""
 
     # optimizer args
-    eps: float = 1e-8
+    eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 1e-6
+    lr: float = 3e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -118,13 +118,13 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = 16
     """The number of gradient accumulation steps"""
     per_device_train_batch_size: int = 4
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
-    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
+    total_episodes: int = int(1e6) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
