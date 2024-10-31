@@ -36,7 +36,7 @@ from transformers import (
 from peft import get_peft_model, LoraConfig
 from utils import set_seed
 
-wandb.login(key=os.environ["WANDB_API_KEY"])
+# wandb.login(key=os.environ["WANDB_API_KEY"])
 
 @dataclass
 class AdaptiveKLParams:
@@ -82,7 +82,8 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
-    rloo_k: int = 1 # number of samples to use for RLOO
+    rloo_k: int = 2 # number of samples to use for RLOO
+    disable_wandb: bool = True
     # common args
     exp_name: str = "pythia"
     """the name of this experiment"""
@@ -313,7 +314,7 @@ def generate(lm_backbone: AutoModelForCausalLM,
         num_return_sequences=n_outputs_per_prompt,
     )
     expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
-    full_sequences = torch.cat((queries, output.sequences[:, context_length:]), dim=1)
+    full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
     return full_sequences
 
 
@@ -382,8 +383,7 @@ class EvalStorage:
 
 
 def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: AutoTokenizer,
-             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True,
-             rloo_k: int = 1) -> Tuple[EvalStorage, pd.DataFrame]:
+             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True) -> Tuple[EvalStorage, pd.DataFrame]:
     """
     Completes an episode rollout for the policy model and returns:
     - reference response and reference response performance
@@ -409,7 +409,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
                 queries = queries,
                 tokenizer = tokenizer,
                 generation_config = generation_config,
-                n_outputs_per_prompt = rloo_k,
+                n_outputs_per_prompt = 1,
             ) # [batch_size * n_outputs_per_prompt, prompt_len + response_len]
 
             responses = query_responses[:, context_length:]
@@ -438,19 +438,23 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             kl = (logprobs - ref_logprobs).sum(1)
 
             postprocessed_responses = truncate_response(args, tokenizer, responses)
+            # expanded_queries = queries.repeat_interleave(rloo_k, dim=0)
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            _, score, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, queries.shape[1])
+            prompt_length = queries.shape[1]
+            _, score, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, prompt_length)
 
             # 7. Calculate baseline (if rloo_k > 1)
-            if rloo_k > 1:
-                # The shape of score is [batch_size * rloo_k]
-                per_prompt_scores = score.reshape(-1, rloo_k)
-                baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (rloo_k - 1) # [batch_size, rloo_k]
-                baseline = baseline.reshape(-1)
-                eval_storage.baseline.append(baseline)
+            # if rloo_k > 1:
+            #     # The shape of score is [batch_size * rloo_k]
+            #     per_prompt_scores = score.reshape(-1, rloo_k)
+            #     baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (rloo_k - 1) # [batch_size, rloo_k]
+            #     baseline = baseline.reshape(-1)
+            #     eval_storage.baseline.append(baseline)
                 
-            else:
-                eval_storage.baseline.append(torch.zeros_like(score))
+            # else:
+            #     eval_storage.baseline.append(torch.zeros_like(score))
+            # TODO: Remove baseline key from eval_storage
+
             eval_storage.query_token.extend(queries)
             eval_storage.reference_response_token.extend(reference_response_token)
             eval_storage.reference_score.append(reference_score)
@@ -497,7 +501,7 @@ if __name__ == "__main__":
         assert (
             args.local_batch_size >= 8
         ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
-        raise NotImplementedError("Whitening is not supported at the moment.")
+        # raise NotImplementedError("Whitening is not supported at the moment.")
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -531,6 +535,7 @@ if __name__ == "__main__":
                 config=asdict(args),
                 name=run_name,
                 save_code=True,
+                mode="disabled" if args.disable_wandb else None,
             )
             file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
             wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
@@ -650,7 +655,7 @@ if __name__ == "__main__":
                 tokenizer,
                 validation_dataloader,
                 validation_generation_config,
-                rloo_k = args.rloo_k,
+                # rloo_k = args.rloo_k,
             )
             validation_score = eval_storage.score[0]
             if args.print_sample_output_freq > 0 and update > 1 and (update - 1) % args.print_sample_output_freq == 0:
@@ -672,7 +677,7 @@ if __name__ == "__main__":
                         validation_dataloader,
                         validation_generation_config,
                         sampling=False,
-                        rloo_k = args.rloo_k
+                        # rloo_k = args.rloo_k
                     )
                     if accelerator.is_main_process:
                         eval_df.to_csv(f"runs/{run_name}/table.csv")
@@ -718,6 +723,7 @@ if __name__ == "__main__":
             values = []
             scores = []
             sequence_lengths = []
+            baselines = []
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
                 query_response = generate(
@@ -725,6 +731,7 @@ if __name__ == "__main__":
                     query,
                     tokenizer,
                     generation_config,
+                    n_outputs_per_prompt=args.rloo_k,
                 )
                 response = query_response[:, context_length:]
 
@@ -748,13 +755,23 @@ if __name__ == "__main__":
                 postprocessed_response = truncate_response(args, tokenizer, response)
 
                 # Response Processing 2. run reward model on the truncated responses
-                postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                expanded_queries = query.repeat_interleave(args.rloo_k, dim=0)
+                postprocessed_query_response = torch.cat((expanded_queries, postprocessed_response), 1)
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
                 full_value, _, _ = get_reward(
                     accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
                 )
                 value = full_value[:, context_length - 1 : -1].squeeze(-1)
                 _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
+
+                # Calculate baselines
+                if args.rloo_k > 1:
+                    # The shape of score is [batch_size * rloo_k]
+                    per_prompt_scores = score.reshape(-1, args.rloo_k)
+                    baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
+                    baseline = baseline.reshape(-1)
+                else:
+                    baseline = torch.zeros_like(score)
 
                 query_responses.append(query_response)
                 responses.append(response)
@@ -764,6 +781,7 @@ if __name__ == "__main__":
                 values.append(value)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
+                baselines.append(baseline)
 
             query_responses = torch.cat(query_responses, 0)
             responses = torch.cat(responses, 0)
@@ -773,7 +791,8 @@ if __name__ == "__main__":
             values = torch.cat(values, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
-            del (logprob, ref_logprob, full_value, value, score)
+            baselines = torch.cat(baselines, 0)
+            del (logprob, ref_logprob, full_value, value, score, baseline)
             torch.cuda.empty_cache()
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id
@@ -784,16 +803,18 @@ if __name__ == "__main__":
             accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
 
             # 4. compute rewards
-            kl = logprobs - ref_logprobs
-            non_score_reward = -kl_ctl.value * kl
-            rewards = non_score_reward.clone()
-            actual_start = torch.arange(rewards.size(0), device=rewards.device)
-            actual_end = sequence_lengths
-            rewards[[actual_start, actual_end]] += scores
+            # kl = logprobs - ref_logprobs # [batch_size, response_len]
+            # non_score_reward = -kl_ctl.value * kl
+            # rewards = non_score_reward.clone()
+            # actual_start = torch.arange(rewards.size(0), device=rewards.device)
+            # actual_end = sequence_lengths
+            # rewards[[actual_start, actual_end]] += scores
+            writer.add_scalar("generation/seq_len_mean", sequence_lengths.mean().item(), update)
+            writer.add_scalar("generation/seq_len_std", sequence_lengths.std().item(), update)
 
             torch.cuda.empty_cache()
 
-        center = 0.1 * torch.mean(torch.sum(non_score_reward, axis=1) + scores)
+        # center = 0.1 * torch.mean(torch.sum(non_score_reward, axis=1) + scores)
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(args.local_batch_size)
@@ -807,6 +828,7 @@ if __name__ == "__main__":
                     mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1)
                     mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
                     mb_reward = scores[mini_batch_inds]
+                    mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
                     output, vpred_temp = forward(model, mb_query_responses, tokenizer)
