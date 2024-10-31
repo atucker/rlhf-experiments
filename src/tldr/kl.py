@@ -82,6 +82,7 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
+    rloo_k: int = 1 # number of samples to use for RLOO
     # common args
     exp_name: str = "pythia"
     """the name of this experiment"""
@@ -118,20 +119,21 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 32
     """The number of gradient accumulation steps"""
-    per_device_train_batch_size: int = 4
+    per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 4
+    per_device_eval_batch_size: int = 2
     """per rank eval batch size"""
+    local_rollout_forward_batch_size: int = 2
+    """per rank no grad forward pass in the rollout phase"""
+
     total_episodes: int = int(1e6) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
     world_size: Optional[int] = 2
     """The number of processes (GPUs) to use"""
-    local_rollout_forward_batch_size: int = 4
-    """per rank no grad forward pass in the rollout phase"""
 
     # other args
     base_model: str = "models/sft_tldr_pythia_1_4b"
@@ -294,7 +296,8 @@ def exact_div(a, b):
 def generate(lm_backbone: AutoModelForCausalLM, 
              queries: torch.Tensor, 
              tokenizer: AutoTokenizer, 
-             generation_config: GenerationConfig) -> torch.Tensor:
+             generation_config: GenerationConfig,
+             n_outputs_per_prompt: int = 1) -> torch.Tensor:
     """
     Generates in a way that does not affect padding tokens.
     """
@@ -307,8 +310,11 @@ def generate(lm_backbone: AutoModelForCausalLM,
         # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
         generation_config=generation_config,
         return_dict_in_generate=True,
+        num_return_sequences=n_outputs_per_prompt,
     )
-    return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
+    expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
+    full_sequences = torch.cat((queries, output.sequences[:, context_length:]), dim=1)
+    return full_sequences
 
 
 def first_true_indices(bools, dtype=torch.long) -> torch.Tensor:
@@ -372,10 +378,12 @@ class EvalStorage:
     postprocessed_response: List[str] = field(default_factory=list)
     reference_response: List[str] = field(default_factory=list)
     kl: List[float] = field(default_factory=list)
+    baseline: List[float] = field(default_factory=list)
 
 
 def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: AutoTokenizer,
-             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True) -> Tuple[EvalStorage, pd.DataFrame]:
+             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True,
+             rloo_k: int = 1) -> Tuple[EvalStorage, pd.DataFrame]:
     """
     Completes an episode rollout for the policy model and returns:
     - reference response and reference response performance
@@ -401,7 +409,8 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
                 queries = queries,
                 tokenizer = tokenizer,
                 generation_config = generation_config,
-            )
+                n_outputs_per_prompt = rloo_k,
+            ) # [batch_size * n_outputs_per_prompt, prompt_len + response_len]
 
             responses = query_responses[:, context_length:]
             output = forward(model = policy, 
@@ -432,6 +441,16 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             _, score, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, queries.shape[1])
 
+            # 7. Calculate baseline (if rloo_k > 1)
+            if rloo_k > 1:
+                # The shape of score is [batch_size * rloo_k]
+                per_prompt_scores = score.reshape(-1, rloo_k)
+                baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (rloo_k - 1) # [batch_size, rloo_k]
+                baseline = baseline.reshape(-1)
+                eval_storage.baseline.append(baseline)
+                
+            else:
+                eval_storage.baseline.append(torch.zeros_like(score))
             eval_storage.query_token.extend(queries)
             eval_storage.reference_response_token.extend(reference_response_token)
             eval_storage.reference_score.append(reference_score)
@@ -478,6 +497,7 @@ if __name__ == "__main__":
         assert (
             args.local_batch_size >= 8
         ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
+        raise NotImplementedError("Whitening is not supported at the moment.")
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -630,6 +650,7 @@ if __name__ == "__main__":
                 tokenizer,
                 validation_dataloader,
                 validation_generation_config,
+                rloo_k = args.rloo_k,
             )
             validation_score = eval_storage.score[0]
             if args.print_sample_output_freq > 0 and update > 1 and (update - 1) % args.print_sample_output_freq == 0:
@@ -651,6 +672,7 @@ if __name__ == "__main__":
                         validation_dataloader,
                         validation_generation_config,
                         sampling=False,
+                        rloo_k = args.rloo_k
                     )
                     if accelerator.is_main_process:
                         eval_df.to_csv(f"runs/{run_name}/table.csv")
@@ -848,6 +870,7 @@ if __name__ == "__main__":
             validation_dataloader,
             validation_generation_config,
             sampling=False,
+            rloo_k = args.rloo_k
         )
         if accelerator.is_main_process:
             eval_df.to_csv(f"runs/{run_name}/table.csv")
