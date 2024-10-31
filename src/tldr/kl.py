@@ -36,7 +36,7 @@ from transformers import (
 from peft import get_peft_model, LoraConfig
 from utils import set_seed
 
-# wandb.login(key=os.environ["WANDB_API_KEY"])
+wandb.login(key=os.environ["WANDB_API_KEY"])
 
 @dataclass
 class AdaptiveKLParams:
@@ -82,7 +82,7 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
-    disable_wandb: bool = True
+    disable_wandb: bool = False
     # common args
     exp_name: str = "pythia"
     """the name of this experiment"""
