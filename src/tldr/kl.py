@@ -82,7 +82,6 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
-    rloo_k: int = 2 # number of samples to use for RLOO
     disable_wandb: bool = True
     # common args
     exp_name: str = "pythia"
@@ -111,7 +110,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 3e-6
+    lr: float = 1e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -120,8 +119,12 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
+
+    # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
+    rloo_k: int = 4 # number of samples to use for RLOO
+    
     per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 2
@@ -803,14 +806,14 @@ if __name__ == "__main__":
             accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
 
             # 4. compute rewards
-            # kl = logprobs - ref_logprobs # [batch_size, response_len]
-            # non_score_reward = -kl_ctl.value * kl
-            # rewards = non_score_reward.clone()
-            # actual_start = torch.arange(rewards.size(0), device=rewards.device)
-            # actual_end = sequence_lengths
-            # rewards[[actual_start, actual_end]] += scores
-            writer.add_scalar("generation/seq_len_mean", sequence_lengths.mean().item(), update)
-            writer.add_scalar("generation/seq_len_std", sequence_lengths.std().item(), update)
+            kl = logprobs - ref_logprobs # [batch_size, response_len]
+            non_score_reward = -kl_ctl.value * kl
+            rewards = non_score_reward.clone()
+            actual_start = torch.arange(rewards.size(0), device=rewards.device)
+            actual_end = sequence_lengths
+            rewards[[actual_start, actual_end]] += scores
+            writer.add_scalar("generation/seq_len_mean", sequence_lengths.to(torch.float32).mean().item(), update)
+            writer.add_scalar("generation/seq_len_std", sequence_lengths.to(torch.float32).std().item(), update)
 
             torch.cuda.empty_cache()
 
@@ -825,7 +828,7 @@ if __name__ == "__main__":
                     # These are all fixed and won't get gradients
                     mb_responses = responses[mini_batch_inds] # [batch_size, response_len]
                     mb_query_responses = query_responses[mini_batch_inds] # [batch_size, seq_len]
-                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1)
+                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1) # [batch_size]
                     mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
                     mb_reward = scores[mini_batch_inds]
                     mb_baseline = baselines[mini_batch_inds]
@@ -843,12 +846,12 @@ if __name__ == "__main__":
                     if args.train_dips:
                         # the IPS trick loss
                         approx_kl = new_logprobs - mb_ref_logprobs
-                        loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - kl_ctl.value * approx_kl))
+                        loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - mb_baseline - kl_ctl.value * approx_kl))
 
                     else:
                         # RLOO loss
                         approx_kl = mb_logprobs - mb_ref_logprobs
-                        loss = torch.mean(-1*new_logprobs * (mb_reward - kl_ctl.value * approx_kl))
+                        loss = torch.mean(-1*new_logprobs * (mb_reward - mb_baseline - kl_ctl.value * approx_kl))
 
                     accelerator.backward(loss)
                     #accelerator.clip_grad_norm_(model.parameters(), 1.0)
@@ -875,6 +878,7 @@ if __name__ == "__main__":
             writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
 
             writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
+            writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
             writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
             writer.add_scalar("train/loss", accelerator.gather(loss_stats).mean().item(), update)
 
