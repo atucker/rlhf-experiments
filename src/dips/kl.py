@@ -304,6 +304,16 @@ def generate(lm_backbone: AutoModelForCausalLM,
              n_outputs_per_prompt: int = 1) -> torch.Tensor:
     """
     Generates in a way that does not affect padding tokens.
+
+    Args:
+        lm_backbone: The language model backbone to use.
+        queries: The queries to generate responses for. Shape: [batch_size, seq_len]
+        tokenizer: The tokenizer to use
+        generation_config: The generation configuration to use
+        n_outputs_per_prompt: The number of outputs to generate per prompt (k in RLOO)
+
+    Returns: 
+        Generated responses. Shape: [batch_size * n_outputs_per_prompt, seq_len]
     """
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
@@ -389,6 +399,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
              dataloader: DataLoader, generation_config: GenerationConfig, sampling=True) -> Tuple[EvalStorage, pd.DataFrame]:
     """
     Completes an episode rollout for the policy model and returns:
+
     - reference response and reference response performance
     - policy-generated response and policy-generated response performance
     - kl divergence between the policy and reference model
@@ -680,7 +691,6 @@ if __name__ == "__main__":
                         validation_dataloader,
                         validation_generation_config,
                         sampling=False,
-                        # rloo_k = args.rloo_k
                     )
                     if accelerator.is_main_process:
                         eval_df.to_csv(f"runs/{run_name}/table.csv")
@@ -716,6 +726,7 @@ if __name__ == "__main__":
             del eval_storage, eval_df
             torch.cuda.empty_cache()
 
+            # ============ Gathering training samples ============
             queries = data["query_token"].to(device)
             context_length = queries.shape[1]
             query_responses = []
