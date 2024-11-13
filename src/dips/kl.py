@@ -588,6 +588,7 @@ if __name__ == "__main__":
         pprint(reward_model.config)
 
     policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
+
     peft_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
@@ -595,6 +596,7 @@ if __name__ == "__main__":
         bias="none",
     )
     policy = get_peft_model(policy, peft_config=peft_config)
+    param_subset = random.sample(list([param for param in policy.parameters() if param.requires_grad]), 5)
     critic = get_peft_model(critic, peft_config=peft_config)
     accelerator.print(policy)
     accelerator.print(critic)
@@ -606,8 +608,6 @@ if __name__ == "__main__":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
-
-    param_subset = random.sample(list(model.parameters()), 5)
 
     dataset = load_dataset(args.task.query_dataset, split="train")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
@@ -879,7 +879,8 @@ if __name__ == "__main__":
                     # Grab model grad norms
                     sampled_grad_norm = []
                     for p in param_subset:
-                        sampled_grad_norm.append(p.grad.norm().item())
+                        if p.grad is not None:
+                            sampled_grad_norm.append(p.grad.norm().item())
                     sampled_grad_norm = torch.tensor(sampled_grad_norm, device=device)
 
                     optimizer.step()
@@ -888,7 +889,8 @@ if __name__ == "__main__":
                     with torch.no_grad():
                         # Do whatever logging we want
                         metrics["loss"][ppo_epoch_idx] += loss.detach()
-                        metrics["grad_norm"][ppo_epoch_idx] += sampled_grad_norm
+                        for idx, p in enumerate(param_subset):
+                            metrics[f"grad_norm_{idx}"][ppo_epoch_idx] += sampled_grad_norm[idx].item()
 
                         if args.train_dips:
                             metrics["weighting"][ppo_epoch_idx] += weighting.mean()
