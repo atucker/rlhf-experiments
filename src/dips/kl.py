@@ -4,6 +4,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Literal, Optional, Tuple, Union
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,7 @@ from transformers import (
 )
 from peft import get_peft_model, LoraConfig
 from utils import set_seed
+import random
 
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
@@ -110,7 +112,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 1e-6
+    lr: float = 3e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -605,6 +607,8 @@ if __name__ == "__main__":
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
 
+    param_subset = random.sample(list(model.parameters()), 5)
+
     dataset = load_dataset(args.task.query_dataset, split="train")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
@@ -650,8 +654,6 @@ if __name__ == "__main__":
     accelerator.print("===training policy===")
     global_step = 0
     start_time = time.time()
-    stats_shape = (args.ppo.noptepochs)
-    loss_stats = torch.zeros(stats_shape, device=device)
 
     model.train()
     for update in range(1, args.ppo.num_updates + 1):
@@ -830,6 +832,10 @@ if __name__ == "__main__":
 
         # center = 0.1 * torch.mean(torch.sum(non_score_reward, axis=1) + scores)
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+
+        stats_shape = (args.ppo.noptepochs)
+        metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
+        
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(args.local_batch_size)
             for mini_batch_start in range(0, args.local_batch_size, args.per_device_train_batch_size):
@@ -857,21 +863,44 @@ if __name__ == "__main__":
                     if args.train_dips:
                         # the IPS trick loss
                         approx_kl = new_logprobs - mb_ref_logprobs
-                        loss = torch.mean(-1*torch.exp(new_logprobs - mb_logprobs) * (mb_reward - mb_baseline - kl_ctl.value * approx_kl))
+                        prob_ratio = torch.exp(new_logprobs - mb_logprobs)
+                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                        loss = torch.mean(-1 * prob_ratio * weighting)
 
                     else:
                         # RLOO loss
                         approx_kl = mb_logprobs - mb_ref_logprobs
-                        loss = torch.mean(-1*new_logprobs * (mb_reward - mb_baseline - kl_ctl.value * approx_kl))
+                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                        loss = torch.mean(-1*new_logprobs * weighting)
 
                     accelerator.backward(loss)
                     #accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
+                    # Grab model grad norms
+                    sampled_grad_norm = []
+                    for p in param_subset:
+                        sampled_grad_norm.append(p.grad.norm().item())
+                    sampled_grad_norm = torch.tensor(sampled_grad_norm, device=device)
+
                     optimizer.step()
                     optimizer.zero_grad()
 
                     with torch.no_grad():
                         # Do whatever logging we want
-                        loss_stats[ppo_epoch_idx] += loss.detach() / args.gradient_accumulation_steps
+                        metrics["loss"][ppo_epoch_idx] += loss.detach()
+                        metrics["grad_norm"][ppo_epoch_idx] += sampled_grad_norm
+
+                        if args.train_dips:
+                            metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                            metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
+                            metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+                        else:
+                            metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                            metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
+                            metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+
+                        for key in metrics:
+                            metrics[key] /= args.gradient_accumulation_steps
                     
         with torch.no_grad():
             mean_kl = kl.sum(1).mean()
@@ -891,7 +920,9 @@ if __name__ == "__main__":
             writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
             writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
-            writer.add_scalar("train/loss", accelerator.gather(loss_stats).mean().item(), update)
+
+            for stats in metrics:
+                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item(), update)
 
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
