@@ -216,7 +216,7 @@ def evaluate(args: Args, accelerator: Accelerator, tokenizer: PreTrainedTokenize
     all_decode_reference_responses = []
     all_losses = []
     unwrapped = accelerator.unwrap_model(model)
-    for _, data in tqdm(enumerate(dataloader)):
+    for _, data in enumerate(dataloader):
         with torch.no_grad():
             queries = data["query_token"]
             reference_responses = data["reference_response_token"]
@@ -396,7 +396,7 @@ if __name__ == "__main__":
     update = 0
     for epoch in range(args.num_train_epochs):
         accelerator.print(f"epoch: {epoch}")
-        for data in dataloader:
+        for data in tqdm(dataloader):
             query_responses = data["query_reference_response_token"].to(device, non_blocking=True)
             with accelerator.accumulate(model):
                 output = forward(model, query_responses, tokenizer)

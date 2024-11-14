@@ -24,7 +24,7 @@ from rich.table import Table
 from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+from tqdm import tqdm, trange
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -408,8 +408,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
     """
     eval_storage = EvalStorage()
     with torch.no_grad():
-        for data in tqdm(dataloader):
-
+        for data in dataloader:
             # 1. Extract queries and reference responses from the dataset
             queries = data["query_token"]
             reference_response_token = data["reference_response_token"]
@@ -596,7 +595,7 @@ if __name__ == "__main__":
         bias="none",
     )
     policy = get_peft_model(policy, peft_config=peft_config)
-    param_subset = random.sample(list([param for param in policy.parameters() if param.requires_grad]), 5)
+    param_subset = list(policy.parameters())
     critic = get_peft_model(critic, peft_config=peft_config)
     accelerator.print(policy)
     accelerator.print(critic)
@@ -656,7 +655,7 @@ if __name__ == "__main__":
     start_time = time.time()
 
     model.train()
-    for update in range(1, args.ppo.num_updates + 1):
+    for update in trange(1, args.ppo.num_updates + 1):
         global_step += 1 * args.batch_size
         frac = 1.0 - ((update - 1.0) / args.ppo.num_updates)
         lrnow = frac * args.lr # linear learning rate decay
@@ -753,7 +752,7 @@ if __name__ == "__main__":
 
                 output = forward(accelerator.unwrap_model(model).policy, query_response, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
-                logits /= args.task.temperature + 1e-7
+                logits /= (args.task.temperature + 1e-7)
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                 del output, logits, all_logprob
@@ -854,7 +853,7 @@ if __name__ == "__main__":
                     output, vpred_temp = forward(model, mb_query_responses, tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
-                    logits /= args.task.temperature + 1e-7
+                    logits /= (args.task.temperature + 1e-7)
                     new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
                     new_logprobs = torch.sum( # index logprobs over vocab dim by what the model actually generated
                         torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
@@ -877,11 +876,13 @@ if __name__ == "__main__":
                     #accelerator.clip_grad_norm_(model.parameters(), 1.0)
 
                     # Grab model grad norms
-                    sampled_grad_norm = []
+                    grad_norms = []
                     for p in param_subset:
                         if p.grad is not None:
-                            sampled_grad_norm.append(p.grad.norm().item())
-                    sampled_grad_norm = torch.tensor(sampled_grad_norm, device=device)
+                            grad_norms.append(p.grad.norm().item())
+                        else:
+                            grad_norms.append(0)
+                    grad_norms = torch.tensor(grad_norms, device=device)
 
                     optimizer.step()
                     optimizer.zero_grad()
@@ -889,8 +890,10 @@ if __name__ == "__main__":
                     with torch.no_grad():
                         # Do whatever logging we want
                         metrics["loss"][ppo_epoch_idx] += loss.detach()
-                        for idx, p in enumerate(param_subset):
-                            metrics[f"grad_norm_{idx}"][ppo_epoch_idx] += sampled_grad_norm[idx].item()
+                        metrics["baseline"][ppo_epoch_idx] += mb_baseline.mean()
+                        metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
+                        metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
+                        metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
 
                         if args.train_dips:
                             metrics["weighting"][ppo_epoch_idx] += weighting.mean()
@@ -922,6 +925,7 @@ if __name__ == "__main__":
             writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
             writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
+            writer.add_scalar("train/baseline", accelerator.gather(baselines.mean()).mean().item(), update)
 
             for stats in metrics:
                 writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item(), update)
