@@ -35,8 +35,10 @@ from transformers import (
     PreTrainedModel,
 )
 from peft import get_peft_model, LoraConfig
-from utils import set_seed
 import random
+
+# Package imports
+from dips.utils import set_seed, get_grad_norms
 
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
@@ -864,7 +866,10 @@ if __name__ == "__main__":
                         approx_kl = new_logprobs - mb_ref_logprobs
                         prob_ratio = torch.exp(new_logprobs - mb_logprobs)
                         weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
-                        loss = torch.mean(-1 * prob_ratio * weighting)
+                        # loss = torch.mean(-1 * prob_ratio * weighting)
+                        policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
+                        kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
+                        loss = policy_loss_term + kl_loss_term
 
                     else:
                         # RLOO loss
@@ -872,18 +877,21 @@ if __name__ == "__main__":
                         weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
                         loss = torch.mean(-1*new_logprobs * weighting)
 
-                    accelerator.backward(loss)
-                    #accelerator.clip_grad_norm_(model.parameters(), 1.0)
 
                     # Grab model grad norms
-                    grad_norms = []
-                    for p in param_subset:
-                        if p.grad is not None:
-                            grad_norms.append(p.grad.norm().item())
-                        else:
-                            grad_norms.append(0)
-                    grad_norms = torch.tensor(grad_norms, device=device)
+                    if args.train_dips:
+                        accelerator.backward(policy_loss_term, retain_graph = True)
+                        policy_term_grad_norms = get_grad_norms(param_subset, device = device)
+                        optimizer.zero_grad()
 
+                        accelerator.backward(kl_loss_term, retain_graph = True)
+                        kl_term_grad_norms = get_grad_norms(param_subset, device = device)
+                        optimizer.zero_grad()
+
+                    accelerator.backward(loss, retain_graph = True) # retain graph to save intermediate grad norms
+                    grad_norms = get_grad_norms(param_subset, device = device)
+                    #accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                    
                     optimizer.step()
                     optimizer.zero_grad()
 
@@ -894,6 +902,16 @@ if __name__ == "__main__":
                         metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
                         metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
                         metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
+
+                        if args.train_dips:
+                            metrics["policy_loss_term"][ppo_epoch_idx] += policy_loss_term
+                            metrics["kl_loss_term"][ppo_epoch_idx] += kl_loss_term
+                            metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
+                            metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
+                            metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
+                            metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
+                            metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
+                            metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
 
                         if args.train_dips:
                             metrics["weighting"][ppo_epoch_idx] += weighting.mean()
@@ -925,7 +943,6 @@ if __name__ == "__main__":
             writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
             writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
-            writer.add_scalar("train/baseline", accelerator.gather(baselines.mean()).mean().item(), update)
 
             for stats in metrics:
                 writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item(), update)
