@@ -760,24 +760,17 @@ if __name__ == "__main__":
 
                     # Grab model grad norms
                     if args.train_dips and args.factor_loss:
-                        with torch.no_grad():
-                            policy_term_grad = torch.autograd.grad(
-                                outputs = policy_loss_term,
-                                inputs = param_subset,
-                                create_graph = False,
-                                retain_graph = True,
-                            )
-                            policy_term_grad_norms = torch.tensor([g.norm() for g in policy_term_grad])
-                            kl_term_grad = torch.autograd.grad(
-                                outputs = kl_loss_term,
-                                inputs = param_subset,
-                                create_graph = False,
-                                retain_graph = True,
-                            )
-                            kl_term_grad_norms = torch.tensor([g.norm() for g in kl_term_grad])
+                        policy_term_grad_norms = get_grad_norms(loss = policy_loss_term,
+                                                                params = param_subset,
+                                                                device = device)
+                        kl_term_grad_norms = get_grad_norms(loss = kl_loss_term,
+                                                            params = param_subset,
+                                                            device = device)
 
+                    grad_norms = get_grad_norms(loss = loss,
+                                                params = param_subset, 
+                                                device = device)
                     accelerator.backward(loss, retain_graph = True) # retain graph to save intermediate grad norms
-                    grad_norms = get_grad_norms(param_subset, device = device)
                     #accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     
                     optimizer.step()
