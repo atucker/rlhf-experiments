@@ -392,6 +392,12 @@ if __name__ == "__main__":
     args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
+    if args.ppo.whiten_rewards:
+        assert (
+            args.local_batch_size >= 8
+        ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
+        # raise NotImplementedError("Whitening is not supported at the moment.")
+
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         padding_side="right",
@@ -468,7 +474,7 @@ if __name__ == "__main__":
         bias="none",
     )
     policy = get_peft_model(policy, peft_config=peft_config)
-    param_subset = list(policy.parameters())
+    param_subset = [p for p in policy.parameters() if p.requires_grad]
     critic = get_peft_model(critic, peft_config=peft_config)
     accelerator.print(policy)
     accelerator.print(critic)
@@ -753,27 +759,22 @@ if __name__ == "__main__":
 
 
                     # Grab model grad norms
-                    if args.train_dips:
+                    if args.train_dips and args.factor_loss:
                         with torch.no_grad():
-                            policy_term_grad_norms = torch.autograd.grad(
+                            policy_term_grad = torch.autograd.grad(
                                 outputs = policy_loss_term,
                                 inputs = param_subset,
                                 create_graph = False,
                                 retain_graph = True,
                             )
-                            kl_term_grad_norms = torch.autograd.grad(
-                                outputs = policy_loss_term,
+                            policy_term_grad_norms = torch.tensor([g.norm() for g in policy_term_grad])
+                            kl_term_grad = torch.autograd.grad(
+                                outputs = kl_loss_term,
                                 inputs = param_subset,
                                 create_graph = False,
                                 retain_graph = True,
                             )
-                        accelerator.backward(policy_loss_term, retain_graph = True)
-                        policy_term_grad_norms = get_grad_norms(param_subset, device = device)
-                        optimizer.zero_grad()
-
-                        accelerator.backward(kl_loss_term, retain_graph = True)
-                        kl_term_grad_norms = get_grad_norms(param_subset, device = device)
-                        optimizer.zero_grad()
+                            kl_term_grad_norms = torch.tensor([g.norm() for g in kl_term_grad])
 
                     accelerator.backward(loss, retain_graph = True) # retain graph to save intermediate grad norms
                     grad_norms = get_grad_norms(param_subset, device = device)
@@ -791,19 +792,18 @@ if __name__ == "__main__":
                         metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
 
                         if args.train_dips:
-                            metrics["policy_loss_term"][ppo_epoch_idx] += policy_loss_term
-                            metrics["kl_loss_term"][ppo_epoch_idx] += kl_loss_term
-                            metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
-                            metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
-                            metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
-                            metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
-                            metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
-                            metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
-
-                        if args.train_dips:
                             metrics["weighting"][ppo_epoch_idx] += weighting.mean()
                             metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
                             metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+                            if args.factor_loss:
+                                metrics["policy_loss_term"][ppo_epoch_idx] += policy_loss_term
+                                metrics["kl_loss_term"][ppo_epoch_idx] += kl_loss_term
+                                metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
+                                metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
+                                metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
+                                metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
+                                metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
+                                metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
                         else:
                             metrics["weighting"][ppo_epoch_idx] += weighting.mean()
                             metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
@@ -847,8 +847,7 @@ if __name__ == "__main__":
             tokenizer,
             validation_dataloader,
             validation_generation_config,
-            sampling=False,
-            rloo_k = args.rloo_k
+            sampling=False
         )
         if accelerator.is_main_process:
             eval_df.to_csv(f"runs/{run_name}/table.csv")

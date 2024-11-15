@@ -133,9 +133,3 @@ def validate_args(args: Args):
     if args.factor_loss:
         assert args.train_dips, "Loss factoring only supports DIPS. Are you using --train_dips?"
     assert args.rloo_k >= 1
-
-    if args.ppo.whiten_rewards:
-        assert (
-            args.local_batch_size >= 8
-        ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
-        # raise NotImplementedError("Whitening is not supported at the moment.")
