@@ -3,7 +3,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dips-dev"
+name = "dios"
 version = "0.1.0"
 description = "A Python package for the DIPS algorithm."
 dynamic = ["dependencies"]
