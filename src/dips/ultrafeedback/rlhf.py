@@ -129,11 +129,11 @@ class Args:
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
     rloo_k: int = 4 # number of samples to use for RLOO
     
-    per_device_train_batch_size: int = 2
+    per_device_train_batch_size: int = 1
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 2
+    per_device_eval_batch_size: int = 1
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 2
+    local_rollout_forward_batch_size: int = 1
     """per rank no grad forward pass in the rollout phase"""
 
     total_episodes: int = int(1e6) # Informs the number of ppo updates to do
@@ -158,7 +158,7 @@ class Args:
     """Which layers to apply dropout to"""
     output_dir: str = "models/llama_3_8b_armoRM_ultrafeedback"
     """Where to save the model"""
-    lora_rank: int = 128
+    lora_rank: int = 32
     """the rank of the lora matrix"""
     lora_alpha: int = 64
     """weight of lora"""
@@ -559,17 +559,23 @@ if __name__ == "__main__":
         hidden_size=model_config.hidden_size,
     )
     if not args.reward_model_path:
-        reward_model: PreTrainedModel = ScalarModel(scalar_model_config)
+        reward_model: PreTrainedModel = AutoModel(scalar_model_config)
     else:
-        reward_model: PreTrainedModel = ScalarModel.from_pretrained(
+        reward_model: PreTrainedModel = AutoModel.from_pretrained(
             args.reward_model_path,
             trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
         )
     if accelerator.is_main_process:
         pprint(model_config)
         pprint(reward_model.config)
 
-    policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
+    policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
+                                                  config=model_config, 
+                                                  trust_remote_code=True,
+                                                  torch_dtype=torch.bfloat16,
+                                                  low_cpu_mem_usage = True)
 
     peft_config = LoraConfig(
         r=args.lora_rank,
@@ -584,9 +590,9 @@ if __name__ == "__main__":
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     
     if args.optimizer == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
+        optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
+        optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
 
     dataset = load_dataset(args.task.query_dataset, split="train")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
