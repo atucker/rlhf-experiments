@@ -279,20 +279,6 @@ def get_reward(reward_model: nn.Module, query_responses: torch.Tensor, tokenizer
     )
 
 
-# taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
-# we did this we can do a single `model = accelerator.prepare(model)`
-class PolicyAndValueWrapper(nn.Module):
-    """
-    A wrapper that fuses the model and its value function. Note that in this implementation the policy and value are both LORAs and share the same backbone.
-    """
-    def __init__(self, policy, critic) -> None:
-        super().__init__()
-        self.policy = policy
-        self.critic = critic
-
-    def forward(self, **kwargs):
-        return self.policy(**kwargs), self.critic(**kwargs)
-
 
 def exact_div(a, b):
     q = a // b
@@ -573,13 +559,8 @@ if __name__ == "__main__":
         hidden_size=model_config.hidden_size,
     )
     if not args.reward_model_path:
-        critic: PreTrainedModel = ScalarModel(scalar_model_config)
         reward_model: PreTrainedModel = ScalarModel(scalar_model_config)
     else:
-        critic: PreTrainedModel = ScalarModel.from_pretrained(
-            args.reward_model_path,
-            trust_remote_code=True,
-        )
         reward_model: PreTrainedModel = ScalarModel.from_pretrained(
             args.reward_model_path,
             trust_remote_code=True,
@@ -598,13 +579,10 @@ if __name__ == "__main__":
     )
     policy = get_peft_model(policy, peft_config=peft_config)
     param_subset = list(policy.parameters())
-    critic = get_peft_model(critic, peft_config=peft_config)
     accelerator.print(policy)
-    accelerator.print(critic)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     
-    model = PolicyAndValueWrapper(policy, critic)
     if args.optimizer == "adam":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
@@ -668,7 +646,7 @@ if __name__ == "__main__":
             eval_storage, eval_df = evaluate(
                 args,
                 reward_model,
-                accelerator.unwrap_model(model).policy,
+                policy,
                 tokenizer,
                 validation_dataloader,
                 validation_generation_config,
@@ -689,7 +667,7 @@ if __name__ == "__main__":
                     eval_storage, eval_df = evaluate(
                         args,
                         reward_model,
-                        accelerator.unwrap_model(model).policy,
+                        policy,
                         tokenizer,
                         validation_dataloader,
                         validation_generation_config,
@@ -713,7 +691,7 @@ if __name__ == "__main__":
                         if args.push_to_hub:
                             tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
-                    unwrapped: PreTrainedModel = accelerator.unwrap_model(model).policy
+                    unwrapped: PreTrainedModel = policy
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         unwrapped.save_pretrained(
@@ -737,14 +715,13 @@ if __name__ == "__main__":
             postprocessed_responses = []
             logprobs = []
             ref_logprobs = []
-            values = []
             scores = []
             sequence_lengths = []
             baselines = []
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
                 query_response = generate(
-                    accelerator.unwrap_model(model).policy,
+                    policy,
                     query,
                     tokenizer,
                     generation_config,
@@ -752,7 +729,7 @@ if __name__ == "__main__":
                 )
                 response = query_response[:, context_length:]
 
-                output = forward(accelerator.unwrap_model(model).policy, query_response, tokenizer)
+                output = forward(policy, query_response, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= (args.task.temperature + 1e-7)
                 all_logprob = F.log_softmax(logits, dim=-1)
@@ -760,7 +737,7 @@ if __name__ == "__main__":
                 del output, logits, all_logprob
                 torch.cuda.empty_cache()
 
-                ref_output = forward(accelerator.unwrap_model(policy), query_response, tokenizer, ref=True)
+                ref_output = forward(policy, query_response, tokenizer, ref=True)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
                 ref_logits /= args.task.temperature + 1e-7
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
@@ -775,10 +752,6 @@ if __name__ == "__main__":
                 expanded_queries = query.repeat_interleave(args.rloo_k, dim=0)
                 postprocessed_query_response = torch.cat((expanded_queries, postprocessed_response), 1)
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
-                full_value, _, _ = get_reward(
-                    accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
-                )
-                value = full_value[:, context_length - 1 : -1].squeeze(-1)
                 _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
 
                 # Calculate baselines
@@ -795,7 +768,6 @@ if __name__ == "__main__":
                 postprocessed_responses.append(postprocessed_response)
                 logprobs.append(logprob)
                 ref_logprobs.append(ref_logprob)
-                values.append(value)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
                 baselines.append(baseline)
@@ -809,7 +781,7 @@ if __name__ == "__main__":
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
             baselines = torch.cat(baselines, 0)
-            del (logprob, ref_logprob, full_value, value, score, baseline)
+            del (logprob, ref_logprob, score, baseline)
             torch.cuda.empty_cache()
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id
@@ -852,7 +824,7 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    output, vpred_temp = forward(model, mb_query_responses, tokenizer)
+                    output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
                     logits /= (args.task.temperature + 1e-7)
@@ -956,7 +928,7 @@ if __name__ == "__main__":
         eval_storage, eval_df = evaluate(
             args,
             reward_model,
-            accelerator.unwrap_model(model).policy,
+            policy,
             tokenizer,
             validation_dataloader,
             validation_generation_config,
@@ -981,7 +953,7 @@ if __name__ == "__main__":
             if args.push_to_hub:
                 tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
-        unwrapped: PreTrainedModel = accelerator.unwrap_model(model).policy
+        unwrapped: PreTrainedModel = policy
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             unwrapped.save_pretrained(
