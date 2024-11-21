@@ -29,6 +29,7 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
     GenerationConfig,
     PretrainedConfig,
@@ -253,31 +254,27 @@ class ScalarModel(PreTrainedModel):
         return reward
 
 
-def get_reward(reward_model: nn.Module, query_responses: torch.Tensor, tokenizer: AutoTokenizer, context_length: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def get_reward(reward_model: nn.Module, 
+               instruction_str: List[str],
+               response_str: List[str], 
+               rm_tokenizer: AutoTokenizer) -> torch.Tensor:
     """
     Uses the reward model to calculate reward information for the given query_responses.
 
-    Returns the logits, reward at the last token position in each sequence, and the sequence lengths.
+    Returns a scalar reward for each query_response pair.
     """
-    attention_mask = query_responses != tokenizer.pad_token_id
-    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits = reward_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-    )
+    messages = [[{"role": "user", "content": instruction},
+                 {"role": "assistant", "content": response}] for instruction, response in zip(instruction_str, response_str)]
+    input_ids = rm_tokenizer.apply_chat_template(messages, return_tensors="pt")
+    input_ids = torch.tensor(input_ids).to(device)
+    attention_mask = input_ids != tokenizer.pad_token_id
+    with torch.no_grad():
+        output = reward_model(input_ids=input_ids, 
+                              attention_mask=attention_mask, 
+                              return_dict=True)
 
-    sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return (
-        reward_logits,
-        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1), # reward at the last token position (e.g the final reward) in each sequence
-        sequence_lengths,
-    )
-
+    return output.score
 
 
 def exact_div(a, b):
@@ -334,6 +331,9 @@ def first_true_indices(bools, dtype=torch.long) -> torch.Tensor:
 
 
 def truncate_response(args, tokenizer, responses):
+    """
+    Truncates responses after the first occurrence of the truncate token.
+    """
     trunc_idxs = first_true_indices(responses == args.task.truncate_token_id).unsqueeze(-1)
     new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
     idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
@@ -399,6 +399,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
         for data in dataloader:
             # 1. Extract queries and reference responses from the dataset
             queries = data["llama_prompt_tokens"].to(device)
+            instruction = data["instruction"]
             context_length = queries.shape[1]
 
             # 2. Generate responses using the given policy model
@@ -415,24 +416,11 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             postprocessed_responses = truncate_response(args, tokenizer, responses)
             # expanded_queries = queries.repeat_interleave(rloo_k, dim=0)
             # postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            prompt_length = queries.shape[1]
-            _, score, _ = get_reward(reward_model = reward_model, 
-                                     query_responses = postprocessed_responses, 
-                                     tokenizer = tokenizer, 
-                                     context_length = prompt_length)
-
-            # 7. Calculate baseline (if rloo_k > 1)
-            # if rloo_k > 1:
-            #     # The shape of score is [batch_size * rloo_k]
-            #     per_prompt_scores = score.reshape(-1, rloo_k)
-            #     baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (rloo_k - 1) # [batch_size, rloo_k]
-            #     baseline = baseline.reshape(-1)
-            #     eval_storage.baseline.append(baseline)
-                
-            # else:
-            #     eval_storage.baseline.append(torch.zeros_like(score))
-            # TODO: Remove baseline key from eval_storage
-
+            score = get_reward(reward_model = reward_model, 
+                                     instruction_str = instruction,
+                                     response_str = tokenizer.batch_decode(postprocessed_responses, skip_special_tokens=True),
+                                     rm_tokenizer = rm_tokenizer)
+            
             eval_storage.query_token.extend(queries)
             eval_storage.postprocessed_response_token.extend(postprocessed_responses)
             eval_storage.score.append(score)
@@ -477,6 +465,11 @@ if __name__ == "__main__":
         args.base_model,
         padding_side="right",
         trust_remote_code=True,
+    )
+
+    rm_tokenizer = AutoTokenizer.from_pretrained(
+        args.reward_model_path,
+        use_fast = True,
     )
     # we use the padding token manually but do not resize the token embedding of the model
     if args.task.truncate_token == "eos":
@@ -525,9 +518,9 @@ if __name__ == "__main__":
         hidden_size=model_config.hidden_size,
     )
     if not args.reward_model_path:
-        reward_model: PreTrainedModel = AutoModel(scalar_model_config)
+        reward_model: PreTrainedModel = AutoModelForSequenceClassification(scalar_model_config)
     else:
-        reward_model: PreTrainedModel = AutoModel.from_pretrained(
+        reward_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
             args.reward_model_path,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16,
@@ -563,9 +556,9 @@ if __name__ == "__main__":
     dataset = load_dataset(args.task.query_dataset, split="train")
     train_val_split = dataset.train_test_split(test_size=0.1, seed=args.seed) # use a consistent seed across runs
     dataset, validation_dataset = train_val_split["train"], train_val_split["test"]
-    dataset = dataset.with_format("torch", columns=["llama_prompt_tokens"])
+    dataset = dataset.with_format("torch", columns=["instruction", "llama_prompt_tokens"])
     dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
-    validation_dataset = validation_dataset.with_format("torch", columns=["llama_prompt_tokens"])
+    validation_dataset = validation_dataset.with_format("torch", columns=["instruction", "llama_prompt_tokens"])
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size)
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
@@ -617,13 +610,12 @@ if __name__ == "__main__":
         with torch.no_grad():
             print("sampling evaluation")
             eval_storage, eval_df = evaluate(
-                args,
-                reward_model,
-                model,
-                tokenizer,
-                validation_dataloader,
-                validation_generation_config,
-                # rloo_k = args.rloo_k,
+                args = args,
+                reward_model = reward_model,
+                policy = model,
+                tokenizer = tokenizer,
+                dataloader = validation_dataloader,
+                generation_config = validation_generation_config,
             )
             validation_score = eval_storage.score[0]
             if args.print_sample_output_freq > 0 and update > 1 and (update - 1) % args.print_sample_output_freq == 0:
@@ -682,6 +674,7 @@ if __name__ == "__main__":
 
             # ============ Gathering training samples ============
             queries = data["query_token"].to(device)
+            instruction = data["instruction"]
             context_length = queries.shape[1]
             query_responses = []
             responses = []
@@ -725,7 +718,10 @@ if __name__ == "__main__":
                 expanded_queries = query.repeat_interleave(args.rloo_k, dim=0)
                 postprocessed_query_response = torch.cat((expanded_queries, postprocessed_response), 1)
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
-                _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
+                score = get_reward(reward_model = reward_model, 
+                                        instruction_str = instruction,
+                                        response_str = tokenizer.batch_decode(postprocessed_responses, skip_special_tokens=True),
+                                        rm_tokenizer = rm_tokenizer)
 
                 # Calculate baselines
                 if args.rloo_k > 1:
@@ -906,7 +902,6 @@ if __name__ == "__main__":
             validation_dataloader,
             validation_generation_config,
             sampling=False,
-            rloo_k = args.rloo_k
         )
         if accelerator.is_main_process:
             eval_df.to_csv(f"runs/{run_name}/table.csv")
