@@ -85,8 +85,8 @@ class TaskHParams:
 
 @dataclass
 class Args:
-    train_dips: bool = False # whether to train via DIPS or RLOO
-    disable_wandb: bool = False
+    train_dips: bool = True # whether to train via DIPS or RLOO
+    disable_wandb: bool = True
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
     """the name of this experiment"""
@@ -398,15 +398,10 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
     with torch.no_grad():
         for data in dataloader:
             # 1. Extract queries and reference responses from the dataset
-            queries = data["query_token"]
-            reference_response_token = data["reference_response_token"]
+            queries = data["llama_prompt_tokens"].to(device)
             context_length = queries.shape[1]
-            query_reference_responses = torch.cat((data["query_token"], data["reference_response_token"]), dim=1)
 
-            # 2. Calculate the reference score (e.g the reward given to full reference sequences)
-            _, reference_score, _ = get_reward(reward_model, query_reference_responses, tokenizer, queries.shape[1])
-
-            # 3. Generate responses using the given policy model
+            # 2. Generate responses using the given policy model
             query_responses = generate(
                 lm_backbone = policy,
                 queries = queries,
@@ -416,35 +411,15 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             ) # [batch_size * n_outputs_per_prompt, prompt_len + response_len]
 
             responses = query_responses[:, context_length:]
-            output = forward(model = policy, 
-                             query_responses = query_responses, 
-                             tokenizer = tokenizer)
-            logits = output.logits[:, context_length - 1 : -1]
-            logits /= generation_config.temperature
-            all_logprob = F.log_softmax(logits, dim=-1)
-
-            # 4. Calculate logprobs for the policy-generated responses.
-            logprobs = torch.gather(all_logprob, 2, responses.unsqueeze(-1)).squeeze(-1)
-            del output, logits, all_logprob
-            torch.cuda.empty_cache()
-
-            # 5. Calculate logprobs under the reference model for the policy-generated responses
-            ref_output = forward(policy, query_responses, tokenizer, ref=True)
-            ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= generation_config.temperature
-            ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-            ref_logprobs = torch.gather(ref_all_logprob, 2, responses.unsqueeze(-1)).squeeze(-1)
-            del ref_output, ref_logits, ref_all_logprob
-            torch.cuda.empty_cache()
-
-            # 6. Calculate KL divergence penalty
-            kl = (logprobs - ref_logprobs).sum(1)
 
             postprocessed_responses = truncate_response(args, tokenizer, responses)
             # expanded_queries = queries.repeat_interleave(rloo_k, dim=0)
-            postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
+            # postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             prompt_length = queries.shape[1]
-            _, score, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, prompt_length)
+            _, score, _ = get_reward(reward_model = reward_model, 
+                                     query_responses = postprocessed_responses, 
+                                     tokenizer = tokenizer, 
+                                     context_length = prompt_length)
 
             # 7. Calculate baseline (if rloo_k > 1)
             # if rloo_k > 1:
@@ -459,31 +434,22 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             # TODO: Remove baseline key from eval_storage
 
             eval_storage.query_token.extend(queries)
-            eval_storage.reference_response_token.extend(reference_response_token)
-            eval_storage.reference_score.append(reference_score)
             eval_storage.postprocessed_response_token.extend(postprocessed_responses)
             eval_storage.score.append(score)
-            eval_storage.kl.append(kl)
 
             if sampling:
                 break
 
     eval_storage.query = tokenizer.batch_decode(eval_storage.query_token, skip_special_tokens=True)
-    eval_storage.reference_response = tokenizer.batch_decode(eval_storage.reference_response_token)
     eval_storage.postprocessed_response = tokenizer.batch_decode(
         eval_storage.postprocessed_response_token, skip_special_tokens=True
     )
     eval_score = torch.cat(eval_storage.score).float().cpu().numpy().tolist()
-    eval_reference_score = torch.cat(eval_storage.reference_score).float().cpu().numpy().tolist()
-    eval_kl = torch.cat(eval_storage.kl).float().cpu().numpy().tolist()
     eval_df = pd.DataFrame(
         {
             "query": gather_object(eval_storage.query),
             "postprocessed_response": gather_object(eval_storage.postprocessed_response),
-            "reference_responses": gather_object(eval_storage.reference_response),
             "scores": gather_object(eval_score),
-            "reference_scores": gather_object(eval_reference_score),
-            "kl": gather_object(eval_kl),
         }
     )
     return eval_storage, eval_df
@@ -595,16 +561,17 @@ if __name__ == "__main__":
         optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
 
     dataset = load_dataset(args.task.query_dataset, split="train")
-    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+    train_val_split = dataset.train_test_split(test_size=0.1, seed=args.seed) # use a consistent seed across runs
+    dataset, validation_dataset = train_val_split["train"], train_val_split["test"]
+    dataset = dataset.with_format("torch", columns=["llama_prompt_tokens"])
     dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
-    validation_dataset = load_dataset(args.task.query_dataset, split="validation")
-    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+    validation_dataset = validation_dataset.with_format("torch", columns=["llama_prompt_tokens"])
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size)
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
     torch.manual_seed(args.seed)
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    model, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
     validation_dataloader = accelerator.prepare(validation_dataloader)
     def repeat_generator():
         while True:
@@ -652,7 +619,7 @@ if __name__ == "__main__":
             eval_storage, eval_df = evaluate(
                 args,
                 reward_model,
-                policy,
+                model,
                 tokenizer,
                 validation_dataloader,
                 validation_generation_config,
@@ -697,7 +664,7 @@ if __name__ == "__main__":
                         if args.push_to_hub:
                             tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
-                    unwrapped: PreTrainedModel = policy
+                    unwrapped: PreTrainedModel = model
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         unwrapped.save_pretrained(
@@ -727,7 +694,7 @@ if __name__ == "__main__":
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
                 query_response = generate(
-                    policy,
+                    model,
                     query,
                     tokenizer,
                     generation_config,
@@ -735,7 +702,7 @@ if __name__ == "__main__":
                 )
                 response = query_response[:, context_length:]
 
-                output = forward(policy, query_response, tokenizer)
+                output = forward(model, query_response, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= (args.task.temperature + 1e-7)
                 all_logprob = F.log_softmax(logits, dim=-1)
@@ -743,7 +710,7 @@ if __name__ == "__main__":
                 del output, logits, all_logprob
                 torch.cuda.empty_cache()
 
-                ref_output = forward(policy, query_response, tokenizer, ref=True)
+                ref_output = forward(model, query_response, tokenizer, ref=True)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
                 ref_logits /= args.task.temperature + 1e-7
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
@@ -820,7 +787,7 @@ if __name__ == "__main__":
             for mini_batch_start in range(0, args.local_batch_size, args.per_device_train_batch_size):
                 mini_batch_end = mini_batch_start + args.per_device_train_batch_size
                 mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
-                with accelerator.accumulate(policy):
+                with accelerator.accumulate(model):
                     # These are all fixed and won't get gradients
                     mb_responses = responses[mini_batch_inds] # [batch_size, response_len]
                     mb_query_responses = query_responses[mini_batch_inds] # [batch_size, seq_len]
@@ -830,7 +797,7 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
+                    output, vpred_temp = forward(model, mb_query_responses, tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
                     logits /= (args.task.temperature + 1e-7)
@@ -934,7 +901,7 @@ if __name__ == "__main__":
         eval_storage, eval_df = evaluate(
             args,
             reward_model,
-            policy,
+            model,
             tokenizer,
             validation_dataloader,
             validation_generation_config,
@@ -959,7 +926,7 @@ if __name__ == "__main__":
             if args.push_to_hub:
                 tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
-        unwrapped: PreTrainedModel = policy
+        unwrapped: PreTrainedModel = model
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             unwrapped.save_pretrained(
