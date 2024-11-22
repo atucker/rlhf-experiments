@@ -73,7 +73,7 @@ class TaskHParams:
     query_dataset: str = "GitBag/ultrafeedback_llama3_eurus"
 
     # Response params
-    response_length: int = 1024
+    response_length: int = 128
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: Literal["eos"] = "eos"
@@ -151,7 +151,7 @@ class Args:
     """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = "RLHFlow/ArmoRM-Llama3-8B-v0.1"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "meta-llama/Meta-Llama-3-8B"
+    sft_model_path: str = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a16"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
@@ -159,9 +159,9 @@ class Args:
     """Which layers to apply dropout to"""
     output_dir: str = "models/llama_3_8b_armoRM_ultrafeedback"
     """Where to save the model"""
-    lora_rank: int = 32
+    lora_rank: int = 4
     """the rank of the lora matrix"""
-    lora_alpha: int = 64
+    lora_alpha: int = 8
     """weight of lora"""
     lora_dropout: float = 0.0
     """dropout for lora"""
@@ -318,6 +318,13 @@ def generate(lm_backbone: AutoModelForCausalLM,
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
     return full_sequences
 
+def debug_tensor_info(tensor, name):
+    print(f"{name}:")
+    print(f"- Shape: {tensor.shape}")
+    print(f"- Device: {tensor.device}")
+    print(f"- Dtype: {tensor.dtype}")
+    print(f"- Memory: {tensor.element_size() * tensor.nelement() / 1024 / 1024:.2f}MB")
+    print(f"- Requires grad: {tensor.requires_grad}")
 
 def first_true_indices(bools, dtype=torch.long) -> torch.Tensor:
     """
@@ -527,8 +534,9 @@ if __name__ == "__main__":
     policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
                                                   config=model_config, 
                                                   trust_remote_code=True,
-                                                  torch_dtype=torch.int8,
+                                                  torch_dtype="auto",
                                                   low_cpu_mem_usage = True)
+    
 
     peft_config = LoraConfig(
         r=args.lora_rank,
@@ -536,6 +544,9 @@ if __name__ == "__main__":
         lora_dropout=args.lora_dropout,
         bias="none",
     )
+    for param in policy.parameters():
+        param.requires_grad = False
+
     policy = get_peft_model(policy, peft_config=peft_config)
     param_subset = list(policy.parameters())
     accelerator.print(policy)
@@ -690,6 +701,7 @@ if __name__ == "__main__":
                 instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
 
+                debug_tensor_info(query_response, "query_response")
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= (args.task.temperature + 1e-7)
@@ -790,7 +802,8 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    output = forward(accelerator.unwrap_model(model), mb_query_responses, tokenizer)
+                    debug_tensor_info(mb_query_responses, "mb_query_responses")
+                    output = forward(accelerator.unwrap_model(model), mb_query_responses.clone().detach(), tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
                     logits /= (args.task.temperature + 1e-7)
