@@ -3,7 +3,7 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dios"
+name = "dips"
 version = "0.1.0"
 description = "A Python package for the DIPS algorithm."
 dynamic = ["dependencies"]
@@ -11,7 +11,7 @@ dynamic = ["dependencies"]
 [project.optional-dependencies]
 quantize = ["coloredlogs==15.0.1",
             "humanfriendly==10.0",
-            "optimum==1.23.3".
+            "optimum==1.23.3",
             "auto-gptq==0.7.1",
             "gekko==1.2.1",
             "sentencepiece==0.2.0"]
