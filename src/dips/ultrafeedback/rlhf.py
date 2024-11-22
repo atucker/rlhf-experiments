@@ -63,7 +63,7 @@ class PpoHParams:
     cliprange_value: float = 0.2
     gamma: float = 1
     lam: float = 0.95
-    whiten_rewards: bool = True
+    whiten_rewards: bool = False
 
 
 @dataclass
@@ -124,17 +124,17 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 1
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
     rloo_k: int = 4 # number of samples to use for RLOO
     
-    per_device_train_batch_size: int = 1
+    per_device_train_batch_size: int = 4
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 1
+    per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 1
+    local_rollout_forward_batch_size: int = 4
     """per rank no grad forward pass in the rollout phase"""
 
     total_episodes: int = int(1e6) # Informs the number of ppo updates to do
@@ -404,7 +404,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
 
             # 2. Generate responses using the given policy model
             query_responses = generate(
-                lm_backbone = policy,
+                lm_backbone = accelerator.unwrap_model(policy),
                 queries = queries,
                 tokenizer = tokenizer,
                 generation_config = generation_config,
@@ -612,7 +612,7 @@ if __name__ == "__main__":
             eval_storage, eval_df = evaluate(
                 args = args,
                 reward_model = reward_model,
-                policy = model,
+                policy = accelerator.unwrap_model(model),
                 tokenizer = tokenizer,
                 dataloader = validation_dataloader,
                 generation_config = validation_generation_config,
@@ -632,7 +632,7 @@ if __name__ == "__main__":
                     eval_storage, eval_df = evaluate(
                         args,
                         reward_model,
-                        policy,
+                        accelerator.unwrap_model(model),
                         tokenizer,
                         validation_dataloader,
                         validation_generation_config,
@@ -656,7 +656,7 @@ if __name__ == "__main__":
                         if args.push_to_hub:
                             tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
-                    unwrapped: PreTrainedModel = model
+                    unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         unwrapped.save_pretrained(
@@ -687,7 +687,7 @@ if __name__ == "__main__":
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
                 query_response = generate(
-                    model,
+                    accelerator.unwrap_model(model),
                     query,
                     tokenizer,
                     generation_config,
@@ -696,7 +696,7 @@ if __name__ == "__main__":
                 instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
 
-                output = forward(model, query_response, tokenizer)
+                output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= (args.task.temperature + 1e-7)
                 all_logprob = F.log_softmax(logits, dim=-1)
@@ -704,7 +704,7 @@ if __name__ == "__main__":
                 del output, logits, all_logprob
                 torch.cuda.empty_cache()
 
-                ref_output = forward(model, query_response, tokenizer, ref=True)
+                ref_output = forward(accelerator.unwrap_model(model), query_response, tokenizer, ref=True)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
                 ref_logits /= args.task.temperature + 1e-7
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
@@ -796,7 +796,7 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    output = forward(model, mb_query_responses, tokenizer)
+                    output = forward(accelerator.unwrap(model), mb_query_responses, tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
                     logits /= (args.task.temperature + 1e-7)
@@ -900,7 +900,7 @@ if __name__ == "__main__":
         eval_storage, eval_df = evaluate(
             args,
             reward_model,
-            model,
+            accelerator.unwrap_model(model),
             tokenizer,
             validation_dataloader,
             validation_generation_config,
@@ -924,7 +924,7 @@ if __name__ == "__main__":
             if args.push_to_hub:
                 tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
-        unwrapped: PreTrainedModel = model
+        unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             unwrapped.save_pretrained(
