@@ -265,7 +265,7 @@ def get_reward(reward_model: nn.Module,
     """
     messages = [[{"role": "user", "content": instruction},
                  {"role": "assistant", "content": response}] for instruction, response in zip(instruction_str, response_str)]
-    input_ids = rm_tokenizer.apply_chat_template(messages, return_tensors="pt")
+    input_ids = rm_tokenizer.apply_chat_template(messages, return_tensors="pt", padding = True)
     input_ids = torch.tensor(input_ids).to(device)
     attention_mask = input_ids != tokenizer.pad_token_id
     with torch.no_grad():
@@ -673,8 +673,8 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
 
             # ============ Gathering training samples ============
-            queries = data["query_token"].to(device)
-            instruction = data["instruction"]
+            queries = data["llama_prompt_tokens"].to(device)
+            instructions = data["instruction"]
             context_length = queries.shape[1]
             query_responses = []
             responses = []
@@ -693,6 +693,7 @@ if __name__ == "__main__":
                     generation_config,
                     n_outputs_per_prompt=args.rloo_k,
                 )
+                instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
 
                 output = forward(model, query_response, tokenizer)
@@ -715,13 +716,16 @@ if __name__ == "__main__":
                 postprocessed_response = truncate_response(args, tokenizer, response)
 
                 # Response Processing 2. run reward model on the truncated responses
-                expanded_queries = query.repeat_interleave(args.rloo_k, dim=0)
-                postprocessed_query_response = torch.cat((expanded_queries, postprocessed_response), 1)
+                repeated_instructions = []
+                for inst in instruction_batch:
+                    repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
+                decoded_responses = tokenizer.batch_decode(postprocessed_response, skip_special_tokens=True)
+                
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
                 score = get_reward(reward_model = reward_model, 
-                                        instruction_str = instruction,
-                                        response_str = tokenizer.batch_decode(postprocessed_responses, skip_special_tokens=True),
-                                        rm_tokenizer = rm_tokenizer)
+                                    instruction_str = repeated_instructions,
+                                    response_str = decoded_responses,
+                                    rm_tokenizer = rm_tokenizer)
 
                 # Calculate baselines
                 if args.rloo_k > 1:
@@ -746,7 +750,6 @@ if __name__ == "__main__":
             postprocessed_responses = torch.cat(postprocessed_responses, 0)
             logprobs = torch.cat(logprobs, 0)
             ref_logprobs = torch.cat(ref_logprobs, 0)
-            values = torch.cat(values, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
             baselines = torch.cat(baselines, 0)
@@ -793,7 +796,7 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    output, vpred_temp = forward(model, mb_query_responses, tokenizer)
+                    output = forward(model, mb_query_responses, tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
                     logits /= (args.task.temperature + 1e-7)
