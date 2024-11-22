@@ -667,7 +667,7 @@ if __name__ == "__main__":
                     per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
                     kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
                     score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
-                    baseline = score_baseline + kl_ctl.value * kl_baseline
+                    baseline = score_baseline - kl_ctl.value * kl_baseline
                     baseline = baseline.reshape(-1)
                 else:
                     baseline = torch.zeros_like(score)
