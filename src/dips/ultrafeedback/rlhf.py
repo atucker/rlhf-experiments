@@ -128,13 +128,13 @@ class Args:
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 4 # number of samples to use for RLOO
+    rloo_k: int = 1 # number of samples to use for RLOO
     
-    per_device_train_batch_size: int = 4
+    per_device_train_batch_size: int = 1
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 4
+    per_device_eval_batch_size: int = 1
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 4
+    local_rollout_forward_batch_size: int = 1
     """per rank no grad forward pass in the rollout phase"""
 
     total_episodes: int = int(1e6) # Informs the number of ppo updates to do
@@ -145,7 +145,7 @@ class Args:
     """The number of processes (GPUs) to use"""
 
     # other args
-    base_model: str = "meta-llama/Meta-Llama-3-8B"
+    base_model: str = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a16"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
@@ -312,6 +312,7 @@ def generate(lm_backbone: AutoModelForCausalLM,
         generation_config=generation_config,
         return_dict_in_generate=True,
         num_return_sequences=n_outputs_per_prompt,
+        return_legacy_cache = True,
     )
     expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
@@ -512,20 +513,13 @@ if __name__ == "__main__":
 
     model_config = AutoConfig.from_pretrained(args.base_model)
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
-    scalar_model_config = ScalarModelConfig(
-        base_model=args.base_model,
-        base_config=model_config,
-        hidden_size=model_config.hidden_size,
+    assert args.reward_model_path, "reward_model_path must be provided"
+    reward_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
+        args.reward_model_path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
     )
-    if not args.reward_model_path:
-        reward_model: PreTrainedModel = AutoModelForSequenceClassification(scalar_model_config)
-    else:
-        reward_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
-            args.reward_model_path,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-        )
     if accelerator.is_main_process:
         pprint(model_config)
         pprint(reward_model.config)
@@ -533,7 +527,7 @@ if __name__ == "__main__":
     policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
                                                   config=model_config, 
                                                   trust_remote_code=True,
-                                                  torch_dtype=torch.bfloat16,
+                                                  torch_dtype=torch.int8,
                                                   low_cpu_mem_usage = True)
 
     peft_config = LoraConfig(
@@ -796,7 +790,7 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    output = forward(accelerator.unwrap(model), mb_query_responses, tokenizer)
+                    output = forward(accelerator.unwrap_model(model), mb_query_responses, tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
                     logits /= (args.task.temperature + 1e-7)

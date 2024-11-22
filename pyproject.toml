@@ -8,5 +8,10 @@ version = "0.1.0"
 description = "A Python package for the DIPS algorithm."
 dynamic = ["dependencies"]
 
+[project.optional-dependencies]
+quantize = ["coloredlogs==15.0.1",
+            "humanfriendly==10.0",
+            "optimum==1.23.3"]
+
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
