@@ -662,7 +662,12 @@ if __name__ == "__main__":
                 if args.rloo_k > 1:
                     # The shape of score is [batch_size * rloo_k]
                     per_prompt_scores = score.reshape(-1, args.rloo_k)
-                    baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
+                    per_prompt_logprobs = torch.sum(logprob, axis = 1).reshape(-1, args.rloo_k)
+                    per_prompt_ref_logprobs = torch.sum(ref_logprob, axis = 1).reshape(-1, args.rloo_k)
+                    per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
+                    kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
+                    score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
+                    baseline = score_baseline + kl_ctl.value * kl_baseline
                     baseline = baseline.reshape(-1)
                 else:
                     baseline = torch.zeros_like(score)
