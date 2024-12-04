@@ -1,3 +1,5 @@
+# TODO: Port updates to kl.py over
+
 import os
 import random
 import time
@@ -73,7 +75,7 @@ class TaskHParams:
     query_dataset: str = "GitBag/ultrafeedback_llama3_eurus"
 
     # Response params
-    response_length: int = 128
+    response_length: int = 512
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: Literal["eos"] = "eos"
@@ -124,11 +126,11 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 16
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 1 # number of samples to use for RLOO
+    rloo_k: int = 4 # number of samples to use for RLOO
     
     per_device_train_batch_size: int = 1
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
@@ -832,7 +834,7 @@ if __name__ == "__main__":
                     # Grab model grad norms
                     if args.train_dips:
                         accelerator.backward(policy_loss_term, retain_graph = True)
-                        policy_term_grad_norms = get_grad_norms(param_subset, device = device)
+                        policy_term_grad_norms = get_grad_norms(params = param_subset, device = device)
                         optimizer.zero_grad()
 
                         accelerator.backward(kl_loss_term, retain_graph = True)
