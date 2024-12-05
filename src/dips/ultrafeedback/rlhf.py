@@ -90,6 +90,7 @@ class TaskHParams:
 class Args:
     train_dips: bool = True # whether to train via DIPS or RLOO
     disable_wandb: bool = True
+    factor_loss: bool = True
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
     """the name of this experiment"""
@@ -139,7 +140,7 @@ class Args:
     local_rollout_forward_batch_size: int = 1
     """per rank no grad forward pass in the rollout phase"""
 
-    total_episodes: int = int(1e6) # Informs the number of ppo updates to do
+    total_episodes: int = int(2e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
@@ -161,9 +162,9 @@ class Args:
     """Which layers to apply dropout to"""
     output_dir: str = "models/llama_3_8b_armoRM_ultrafeedback"
     """Where to save the model"""
-    lora_rank: int = 4
+    lora_rank: int = 8
     """the rank of the lora matrix"""
-    lora_alpha: int = 8
+    lora_alpha: int = 16
     """weight of lora"""
     lora_dropout: float = 0.0
     """dropout for lora"""
@@ -216,44 +217,6 @@ def whiten(values, shift_mean=True):
     if not shift_mean:
         whitened += mean
     return whitened
-
-
-class ScalarModelConfig(PretrainedConfig):
-    def __init__(
-        self,
-        base_model: str = None,
-        base_config: PretrainedConfig = None,
-        hidden_size: int = 768,
-        bias: float = 0.0,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.base_model = base_model
-        self.base_config = base_config
-        self.hidden_size = hidden_size
-        self.bias = bias
-
-
-class ScalarModel(PreTrainedModel):
-    config_class = ScalarModelConfig
-
-    def __init__(self, config: ScalarModelConfig):
-        super().__init__(config)
-        self.config = config
-        self.lm_backbone = AutoModel.from_pretrained(
-            config.base_model,
-            config=self.config.base_config,
-            trust_remote_code=True,
-        )
-        self.scalar_head = layer_init(
-            nn.Linear(self.config.hidden_size, 1),
-            std=1 / np.sqrt(self.config.hidden_size + 1),
-        )
-
-    def forward(self, **kwargs):
-        output = self.lm_backbone(**kwargs)
-        reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
-        return reward
 
 
 def get_reward(reward_model: nn.Module, 
@@ -739,7 +702,12 @@ if __name__ == "__main__":
                 if args.rloo_k > 1:
                     # The shape of score is [batch_size * rloo_k]
                     per_prompt_scores = score.reshape(-1, args.rloo_k)
-                    baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
+                    per_prompt_logprobs = torch.sum(logprob, axis = 1).reshape(-1, args.rloo_k)
+                    per_prompt_ref_logprobs = torch.sum(ref_logprob, axis = 1).reshape(-1, args.rloo_k)
+                    per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
+                    kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
+                    score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
+                    baseline = score_baseline - kl_ctl.value * kl_baseline
                     baseline = baseline.reshape(-1)
                 else:
                     baseline = torch.zeros_like(score)
@@ -808,7 +776,7 @@ if __name__ == "__main__":
                     output = forward(accelerator.unwrap_model(model), mb_query_responses.clone().detach(), tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
-                    logits /= (args.task.temperature + 1e-7)
+                    logits /= (args.task.temperature + 1e-6)
                     new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
                     new_logprobs = torch.sum( # index logprobs over vocab dim by what the model actually generated
                         torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
@@ -819,10 +787,13 @@ if __name__ == "__main__":
                         approx_kl = new_logprobs - mb_ref_logprobs
                         prob_ratio = torch.exp(new_logprobs - mb_logprobs)
                         weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
-                        # loss = torch.mean(-1 * prob_ratio * weighting)
-                        policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
-                        kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
-                        loss = policy_loss_term + kl_loss_term
+
+                        if args.factor_loss:
+                            policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
+                            kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
+                            loss = policy_loss_term + kl_loss_term
+                        else:
+                            loss = torch.mean(-1 * prob_ratio * weighting)
 
                     else:
                         # RLOO loss
@@ -832,17 +803,19 @@ if __name__ == "__main__":
 
 
                     # Grab model grad norms
-                    if args.train_dips:
-                        accelerator.backward(policy_loss_term, retain_graph = True)
-                        policy_term_grad_norms = get_grad_norms(params = param_subset, device = device)
-                        optimizer.zero_grad()
+                    if args.train_dips and args.factor_loss:
+                        policy_term_grad_norms = get_grad_norms(loss = policy_loss_term,
+                                                                params = param_subset,
+                                                                device = device)
+                        kl_term_grad_norms = get_grad_norms(loss = kl_loss_term,
+                                                            params = param_subset,
+                                                            device = device)
 
-                        accelerator.backward(kl_loss_term, retain_graph = True)
-                        kl_term_grad_norms = get_grad_norms(param_subset, device = device)
-                        optimizer.zero_grad()
+                    grad_norms = get_grad_norms(loss = loss,
+                                                params = param_subset, 
+                                                device = device)
 
                     accelerator.backward(loss, retain_graph = True) # retain graph to save intermediate grad norms
-                    grad_norms = get_grad_norms(param_subset, device = device)
                     #accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     
                     optimizer.step()
@@ -857,19 +830,18 @@ if __name__ == "__main__":
                         metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
 
                         if args.train_dips:
-                            metrics["policy_loss_term"][ppo_epoch_idx] += policy_loss_term
-                            metrics["kl_loss_term"][ppo_epoch_idx] += kl_loss_term
-                            metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
-                            metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
-                            metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
-                            metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
-                            metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
-                            metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
-
-                        if args.train_dips:
                             metrics["weighting"][ppo_epoch_idx] += weighting.mean()
                             metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
                             metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+                            if args.factor_loss:
+                                metrics["policy_loss_term"][ppo_epoch_idx] += policy_loss_term
+                                metrics["kl_loss_term"][ppo_epoch_idx] += kl_loss_term
+                                metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
+                                metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
+                                metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
+                                metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
+                                metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
+                                metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
                         else:
                             metrics["weighting"][ppo_epoch_idx] += weighting.mean()
                             metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
