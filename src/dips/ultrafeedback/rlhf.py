@@ -89,8 +89,8 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = True # whether to train via DIPS or RLOO
-    disable_wandb: bool = True
-    factor_loss: bool = True
+    disable_wandb: bool = False
+    factor_loss: bool = False
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
     """the name of this experiment"""
@@ -513,7 +513,7 @@ if __name__ == "__main__":
         param.requires_grad = False
 
     policy = get_peft_model(policy, peft_config=peft_config)
-    param_subset = list(policy.parameters())
+    param_subset = [param for param in policy.parameters() if param.requires_grad]
     accelerator.print(policy)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
