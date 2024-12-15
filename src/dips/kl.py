@@ -9,6 +9,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import torch
+import torch.amp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -272,6 +273,27 @@ class EvalStorage:
     kl: List[float] = field(default_factory=list)
     baseline: List[float] = field(default_factory=list)
 
+class PrecisionWrapper(nn.Module):
+    def __init__(self, model: PreTrainedModel):
+        super().__init__()
+        self.model = model
+        self.lm_head = model.get_output_embeddings()
+    
+    def forward(self, **kwargs):
+        before_unembed = self.model(**kwargs, output_hidden_states = True).hidden_states[-1]
+
+        with torch.amp.autocast(device_type = "cuda", enabled = False):
+            before_unembed = before_unembed.to(torch.float32)
+            logits = self.lm_head(before_unembed)
+        return logits
+
+class PrecisionModel(AutoModelForCausalLM):
+    def forward(self, *args, **kwargs):
+        before_unembed = super().forward(*args, **kwargs, output_hidden_states = True).hidden_states[-1]
+        with torch.amp.autocast(device_type = "cuda", enabled = False):
+            before_unembed = before_unembed.to(torch.float32)
+            logits = self.lm_head(before_unembed)
+        return logits
 
 def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: AutoTokenizer,
              dataloader: DataLoader, generation_config: GenerationConfig, sampling=True) -> Tuple[EvalStorage, pd.DataFrame]:
@@ -304,6 +326,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             ) # [batch_size * n_outputs_per_prompt, prompt_len + response_len]
 
             responses = query_responses[:, context_length:]
+
             output = forward(model = policy, 
                              query_responses = query_responses, 
                              tokenizer = tokenizer)
@@ -469,7 +492,10 @@ if __name__ == "__main__":
         pprint(model_config)
         pprint(reward_model.config)
 
-    policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
+    if not args.loss_mixed_precision:
+        policy = PrecisionModel.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
+    else:
+        policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
 
     peft_config = LoraConfig(
         r=args.lora_rank,
@@ -634,6 +660,7 @@ if __name__ == "__main__":
                 response = query_response[:, context_length:]
 
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
+                print(f"output dtype: {output.logits.dtype}")
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= (args.task.temperature + 1e-7)
                 all_logprob = F.log_softmax(logits, dim=-1)
