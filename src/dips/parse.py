@@ -48,7 +48,6 @@ class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
     disable_wandb: bool = False
     factor_loss: bool = False
-    use_critic: bool = False
     loss_mixed_precision: bool = False
     # common args
     exp_name: str = "pythia"
@@ -92,11 +91,11 @@ class Args:
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
     rloo_k: int = 4 # number of samples to use for RLOO
     
-    per_device_train_batch_size: int = 2
+    per_device_train_batch_size: int = 8
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 2
+    per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 2
+    local_rollout_forward_batch_size: int = 8
     """per rank no grad forward pass in the rollout phase"""
 
     total_episodes: int = int(1e4) # Informs the number of ppo updates to do
