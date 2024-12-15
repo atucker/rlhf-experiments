@@ -379,9 +379,14 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
-                              kwargs_handlers = [DistributedDataParallelKwargs(find_unused_parameters = True)]) 
+
+    handlers = []
+    if args.use_critic:
+        handlers = [DistributedDataParallelKwargs(find_unused_parameters=True)]
     #                           ^ Necessary for the policy-value wrapper trick we pull
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
+                              kwargs_handlers = handlers) 
+
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
     set_seed(local_seed)
 
@@ -475,13 +480,18 @@ if __name__ == "__main__":
     )
     policy = get_peft_model(policy, peft_config=peft_config)
     param_subset = [p for p in policy.parameters() if p.requires_grad]
-    critic = get_peft_model(critic, peft_config=peft_config)
     accelerator.print(policy)
-    accelerator.print(critic)
+    if args.use_critic:
+        critic = get_peft_model(critic, peft_config=peft_config)
+        accelerator.print(critic)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     
-    model = PolicyAndValueWrapper(policy, critic)
+    if args.use_critic:
+        model = PolicyAndValueWrapper(policy, critic)
+    else:
+        model = policy
+
     if args.optimizer == "adam":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
@@ -614,7 +624,7 @@ if __name__ == "__main__":
             postprocessed_responses = []
             logprobs = []
             ref_logprobs = []
-            values = []
+            # values = []
             scores = []
             sequence_lengths = []
             baselines = []
@@ -652,10 +662,10 @@ if __name__ == "__main__":
                 expanded_queries = query.repeat_interleave(args.rloo_k, dim=0)
                 postprocessed_query_response = torch.cat((expanded_queries, postprocessed_response), 1)
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
-                full_value, _, _ = get_reward(
-                    accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
-                )
-                value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                # full_value, _, _ = get_reward(
+                #     accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
+                # )
+                # value = full_value[:, context_length - 1 : -1].squeeze(-1)
                 _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
 
                 # Calculate baselines
@@ -677,7 +687,7 @@ if __name__ == "__main__":
                 postprocessed_responses.append(postprocessed_response)
                 logprobs.append(logprob)
                 ref_logprobs.append(ref_logprob)
-                values.append(value)
+                # values.append(value)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
                 baselines.append(baseline)
@@ -687,11 +697,12 @@ if __name__ == "__main__":
             postprocessed_responses = torch.cat(postprocessed_responses, 0)
             logprobs = torch.cat(logprobs, 0)
             ref_logprobs = torch.cat(ref_logprobs, 0)
-            values = torch.cat(values, 0)
+            # values = torch.cat(values, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
             baselines = torch.cat(baselines, 0)
-            del (logprob, ref_logprob, full_value, value, score, baseline)
+            # del (logprob, ref_logprob, full_value, value, score, baseline)
+            del (logprob, ref_logprob, score, baseline)
             torch.cuda.empty_cache()
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id
@@ -743,24 +754,25 @@ if __name__ == "__main__":
                         torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
                     ) # shape [batch_size] (total logprob of the response)
 
-                    if args.train_dips:
-                        # the IPS trick loss
-                        approx_kl = new_logprobs - mb_ref_logprobs
-                        prob_ratio = torch.exp(new_logprobs - mb_logprobs)
-                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                    with torch.amp.autocast(enabled = args.loss_mixed_precision):
+                        if args.train_dips:
+                            # the IPS trick loss
+                            approx_kl = new_logprobs - mb_ref_logprobs
+                            prob_ratio = torch.exp(new_logprobs - mb_logprobs)
+                            weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
 
-                        if args.factor_loss:
-                            policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
-                            kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
-                            loss = policy_loss_term + kl_loss_term
+                            if args.factor_loss:
+                                policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
+                                kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
+                                loss = policy_loss_term + kl_loss_term
+                            else:
+                                loss = torch.mean(-1 * prob_ratio * weighting)
+
                         else:
-                            loss = torch.mean(-1 * prob_ratio * weighting)
-
-                    else:
-                        # RLOO loss
-                        approx_kl = mb_logprobs - mb_ref_logprobs
-                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
-                        loss = torch.mean(-1*new_logprobs * weighting)
+                            # RLOO loss
+                            approx_kl = mb_logprobs - mb_ref_logprobs
+                            weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                            loss = torch.mean(-1*new_logprobs * weighting)
 
 
                     # Grab model grad norms

@@ -48,6 +48,8 @@ class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
     disable_wandb: bool = False
     factor_loss: bool = False
+    use_critic: bool = False
+    loss_mixed_precision: bool = False
     # common args
     exp_name: str = "pythia"
     """the name of this experiment"""
