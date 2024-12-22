@@ -79,7 +79,6 @@ class AdaptiveKLController:
         mult = 1 + proportional_error * n_steps / self.hparams.horizon
         self.value *= mult
 
-
 def whiten(values, shift_mean=True):
     # `unbiased=False` matches TF `tf.nn.moments`'s setting
     # Normalize the values to have a mean of 0 (if shift_mean is false) and a variance of 1

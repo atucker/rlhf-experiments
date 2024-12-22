@@ -91,7 +91,7 @@ class Args:
     train_dips: bool = True # whether to train via DIPS or RLOO
     disable_wandb: bool = False
     factor_loss: bool = False
-    debug_tensor_info: bool = True
+    debug_tensor_info: bool = False
     loss_full_precision: bool = True
     unembed_full_precision: bool = True
 
@@ -122,7 +122,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 1e-7
+    lr: float = 3e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -134,11 +134,11 @@ class Args:
     # default args
     batch_size: int = -1
 
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 1 # number of samples to use for RLOO
+    rloo_k: int = 4 # number of samples to use for RLOO
     
     per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
@@ -147,7 +147,7 @@ class Args:
     local_rollout_forward_batch_size: int = 2
     """per rank no grad forward pass in the rollout phase"""
 
-    total_episodes: int = int(2e4) # Informs the number of ppo updates to do
+    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
