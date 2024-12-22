@@ -71,8 +71,8 @@ class PpoHParams:
 @dataclass
 class TaskHParams:
     # Query params
-    query_length: int = 512
-    query_dataset: str = "GitBag/ultrafeedback_llama3_eurus"
+    query_length: int = 256 # Filter out queries longer than this
+    query_dataset: str = "openbmb/UltraFeedback"
 
     # Response params
     response_length: int = 512
@@ -91,6 +91,10 @@ class Args:
     train_dips: bool = True # whether to train via DIPS or RLOO
     disable_wandb: bool = False
     factor_loss: bool = False
+    debug_tensor_info: bool = True
+    loss_full_precision: bool = True
+    unembed_full_precision: bool = True
+
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
     """the name of this experiment"""
@@ -127,17 +131,20 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 16
+    # default args
+    batch_size: int = -1
+
+    gradient_accumulation_steps: int = 1
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 4 # number of samples to use for RLOO
+    rloo_k: int = 1 # number of samples to use for RLOO
     
-    per_device_train_batch_size: int = 1
+    per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 1
+    per_device_eval_batch_size: int = 2
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 1
+    local_rollout_forward_batch_size: int = 2
     """per rank no grad forward pass in the rollout phase"""
 
     total_episodes: int = int(2e4) # Informs the number of ppo updates to do
@@ -218,6 +225,8 @@ def whiten(values, shift_mean=True):
         whitened += mean
     return whitened
 
+def filter_by_length(sample, tokenizer, max_length: int = 256):
+    return len(tokenizer(sample["instruction"]).input_ids) <= max_length
 
 def get_reward(reward_model: nn.Module, 
                instruction_str: List[str],
@@ -242,12 +251,13 @@ def get_reward(reward_model: nn.Module,
     return output.score
 
 
-def exact_div(a, b):
-    q = a // b
-    if a != q * b:
-        raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
-    return q
-
+class PrecisionModel(AutoModelForCausalLM):
+    def forward(self, *args, **kwargs):
+        before_unembed = super().forward(*args, **kwargs, output_hidden_states = True).hidden_states[-1]
+        with torch.amp.autocast(device_type = "cuda", enabled = False):
+            before_unembed = before_unembed.to(torch.float32)
+            logits = self.lm_head(before_unembed)
+        return logits
 
 def generate(lm_backbone: AutoModelForCausalLM, 
              queries: torch.Tensor, 
@@ -283,13 +293,14 @@ def generate(lm_backbone: AutoModelForCausalLM,
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
     return full_sequences
 
-def debug_tensor_info(tensor, name):
-    print(f"{name}:")
-    print(f"- Shape: {tensor.shape}")
-    print(f"- Device: {tensor.device}")
-    print(f"- Dtype: {tensor.dtype}")
-    print(f"- Memory: {tensor.element_size() * tensor.nelement() / 1024 / 1024:.2f}MB")
-    print(f"- Requires grad: {tensor.requires_grad}")
+def debug_tensor_info(tensor, name, enabled = True):
+    if enabled:
+        print(f"{name}:")
+        print(f"- Shape: {tensor.shape}")
+        print(f"- Device: {tensor.device}")
+        print(f"- Dtype: {tensor.dtype}")
+        print(f"- Memory: {tensor.element_size() * tensor.nelement() / 1024 / 1024:.2f}MB")
+        print(f"- Requires grad: {tensor.requires_grad}")
 
 def first_true_indices(bools, dtype=torch.long) -> torch.Tensor:
     """
@@ -371,8 +382,13 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
     with torch.no_grad():
         for data in dataloader:
             # 1. Extract queries and reference responses from the dataset
-            queries = data["llama_prompt_tokens"].to(device)
             instruction = data["instruction"]
+            queries = tokenizer(instruction, 
+                                padding="max_length", 
+                                max_length=args.task.query_length, 
+                                truncation=True,
+                                return_tensors="pt")
+            queries = queries.input_ids.to(device)
             context_length = queries.shape[1]
 
             # 2. Generate responses using the given policy model
@@ -496,12 +512,21 @@ if __name__ == "__main__":
         pprint(model_config)
         pprint(reward_model.config)
 
-    policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
-                                                  config=model_config, 
-                                                  trust_remote_code=True,
-                                                  torch_dtype="auto",
-                                                  low_cpu_mem_usage = True)
+    if args.unembed_full_precision:
+        policy = PrecisionModel.from_pretrained(args.sft_model_path,
+                                                config=model_config,
+                                                trust_remote_code=True,
+                                                low_cpu_mem_usage = True)
+    else:
+        policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
+                                                    config=model_config, 
+                                                    trust_remote_code=True,
+                                                    torch_dtype="auto",
+                                                    low_cpu_mem_usage = True)
     
+    # Freeze the policy model base weights
+    for param in policy.parameters():
+        param.requires_grad = False
 
     peft_config = LoraConfig(
         r=args.lora_rank,
@@ -509,8 +534,6 @@ if __name__ == "__main__":
         lora_dropout=args.lora_dropout,
         bias="none",
     )
-    for param in policy.parameters():
-        param.requires_grad = False
 
     policy = get_peft_model(policy, peft_config=peft_config)
     param_subset = [param for param in policy.parameters() if param.requires_grad]
@@ -526,9 +549,11 @@ if __name__ == "__main__":
     dataset = load_dataset(args.task.query_dataset, split="train")
     train_val_split = dataset.train_test_split(test_size=0.1, seed=args.seed) # use a consistent seed across runs
     dataset, validation_dataset = train_val_split["train"], train_val_split["test"]
-    dataset = dataset.with_format("torch", columns=["instruction", "llama_prompt_tokens"])
+    dataset = dataset.with_format("torch", columns=["instruction"])
+    dataset = dataset.filter(lambda x: filter_by_length(x, tokenizer, args.task.query_length))
     dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
-    validation_dataset = validation_dataset.with_format("torch", columns=["instruction", "llama_prompt_tokens"])
+    validation_dataset = validation_dataset.with_format("torch", columns=["instruction"])
+    validation_dataset = validation_dataset.filter(lambda x: filter_by_length(x, tokenizer, args.task.query_length))
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size)
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
@@ -643,8 +668,13 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
 
             # ============ Gathering training samples ============
-            queries = data["llama_prompt_tokens"].to(device)
             instructions = data["instruction"]
+            queries = tokenizer(instructions, 
+                                padding="max_length", 
+                                max_length=args.task.query_length, 
+                                truncation=True,
+                                return_tensors="pt")
+            queries = queries.input_ids.to(device)
             context_length = queries.shape[1]
             query_responses = []
             responses = []
@@ -666,7 +696,7 @@ if __name__ == "__main__":
                 instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
 
-                debug_tensor_info(query_response, "query_response")
+                debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= (args.task.temperature + 1e-7)
@@ -772,7 +802,7 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    debug_tensor_info(mb_query_responses, "mb_query_responses")
+                    debug_tensor_info(mb_query_responses, "mb_query_responses", enabled = args.debug_tensor_info)
                     output = forward(accelerator.unwrap_model(model), mb_query_responses.clone().detach(), tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
@@ -782,24 +812,26 @@ if __name__ == "__main__":
                         torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
                     ) # shape [batch_size] (total logprob of the response)
 
-                    if args.train_dips:
-                        # the IPS trick loss
-                        approx_kl = new_logprobs - mb_ref_logprobs
-                        prob_ratio = torch.exp(new_logprobs - mb_logprobs)
-                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                    with torch.amp.autocast(device_type = "cuda",
+                                            enabled = not args.loss_full_precision):
+                        if args.train_dips:
+                            # the IPS trick loss
+                            approx_kl = new_logprobs - mb_ref_logprobs
+                            prob_ratio = torch.exp(new_logprobs - mb_logprobs)
+                            weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
 
-                        if args.factor_loss:
-                            policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
-                            kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
-                            loss = policy_loss_term + kl_loss_term
+                            if args.factor_loss:
+                                policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
+                                kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
+                                loss = policy_loss_term + kl_loss_term
+                            else:
+                                loss = torch.mean(-1 * prob_ratio * weighting)
+
                         else:
-                            loss = torch.mean(-1 * prob_ratio * weighting)
-
-                    else:
-                        # RLOO loss
-                        approx_kl = mb_logprobs - mb_ref_logprobs
-                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
-                        loss = torch.mean(-1*new_logprobs * weighting)
+                            # RLOO loss
+                            approx_kl = mb_logprobs - mb_ref_logprobs
+                            weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                            loss = torch.mean(-1*new_logprobs * weighting)
 
 
                     # Grab model grad norms

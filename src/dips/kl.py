@@ -153,29 +153,6 @@ def get_reward(reward_model: nn.Module, query_responses: torch.Tensor, tokenizer
         sequence_lengths,
     )
 
-
-# # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
-# # we did this we can do a single `model = accelerator.prepare(model)`
-# class PolicyAndValueWrapper(nn.Module):
-#     """
-#     A wrapper that fuses the model and its value function. Note that in this implementation the policy and value are both LORAs and share the same backbone.
-#     """
-#     def __init__(self, policy, critic) -> None:
-#         super().__init__()
-#         self.policy = policy
-#         self.critic = critic
-
-#     def forward(self, **kwargs):
-#         return self.policy(**kwargs), self.critic(**kwargs)
-
-
-def exact_div(a, b):
-    q = a // b
-    if a != q * b:
-        raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
-    return q
-
-
 def generate(lm_backbone: AutoModelForCausalLM, 
              queries: torch.Tensor, 
              tokenizer: AutoTokenizer, 
@@ -221,8 +198,7 @@ def first_true_indices(bools, dtype=torch.long) -> torch.Tensor:
     zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
     return torch.min(zero_or_index, dim=-1).values
 
-
-def truncate_response(args, tokenizer, responses):
+def truncate_response(args, tokenizer: AutoTokenizer, responses: torch.Tensor) -> torch.Tensor:
     trunc_idxs = first_true_indices(responses == args.task.truncate_token_id).unsqueeze(-1)
     new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
     idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
@@ -272,20 +248,6 @@ class EvalStorage:
     reference_response: List[str] = field(default_factory=list)
     kl: List[float] = field(default_factory=list)
     baseline: List[float] = field(default_factory=list)
-
-class PrecisionWrapper(nn.Module):
-    def __init__(self, model: PreTrainedModel):
-        super().__init__()
-        self.model = model
-        self.lm_head = model.get_output_embeddings()
-    
-    def forward(self, **kwargs):
-        before_unembed = self.model(**kwargs, output_hidden_states = True).hidden_states[-1]
-
-        with torch.amp.autocast(device_type = "cuda", enabled = False):
-            before_unembed = before_unembed.to(torch.float32)
-            logits = self.lm_head(before_unembed)
-        return logits
 
 class PrecisionModel(AutoModelForCausalLM):
     def forward(self, *args, **kwargs):
@@ -492,7 +454,7 @@ if __name__ == "__main__":
         pprint(model_config)
         pprint(reward_model.config)
 
-    if not args.loss_mixed_precision:
+    if args.unembed_full_precision:
         policy = PrecisionModel.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
     else:
         policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
@@ -776,7 +738,7 @@ if __name__ == "__main__":
                     ) # shape [batch_size] (total logprob of the response)
 
                     with torch.amp.autocast(device_type = "cuda",
-                                            enabled = args.loss_mixed_precision):
+                                            enabled = not args.loss_full_precision):
                         if args.train_dips:
                             # the IPS trick loss
                             approx_kl = new_logprobs - mb_ref_logprobs
