@@ -17,7 +17,7 @@ import torch.optim as optim
 import tyro
 import wandb
 from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.state import AcceleratorState
+from accelerate.state import AcceleratorState, DistributedType
 from accelerate.utils import gather_object
 from datasets import load_dataset
 from rich.console import Console
@@ -39,6 +39,7 @@ from transformers import (
 )
 from peft import get_peft_model, LoraConfig
 import random
+import warnings
 
 # Package imports
 from dips.utils import set_seed, get_grad_norms
@@ -75,7 +76,7 @@ class TaskHParams:
     query_dataset: str = "openbmb/UltraFeedback"
 
     # Response params
-    response_length: int = 512
+    response_length: int = 256
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: Literal["eos"] = "eos"
@@ -122,7 +123,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 3e-6
+    lr: float = 1e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -144,8 +145,8 @@ class Args:
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 2
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 2
-    """per rank no grad forward pass in the rollout phase"""
+    local_rollout_forward_batch_size: int = 16
+    """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k"""
 
     total_episodes: int = int(1e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
@@ -324,6 +325,21 @@ def truncate_response(args, tokenizer, responses):
     postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
     return postprocessed_responses
 
+def force_clear_grads(accelerator, model, optimizer):
+    # Exit any no_sync states if they exist
+    if accelerator.distributed_type == DistributedType.DDP:
+        if hasattr(model, '_no_sync_context'):
+            model._no_sync_context.__exit__(None, None, None)
+    
+    # For DeepSpeed, ensure gradient sync is enabled
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        model.enable_gradient_sync()
+    
+    # Clear gradients
+    optimizer.zero_grad()
+    
+    # Force CUDA cache cleanup
+    torch.cuda.empty_cache()
 
 def forward(model: AutoModelForCausalLM, 
             query_responses: torch.Tensor, 
@@ -442,12 +458,15 @@ if __name__ == "__main__":
 
     args.world_size = accelerator.num_processes
     args.batch_size = args.per_device_train_batch_size * args.world_size * args.gradient_accumulation_steps
-    args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
-    if args.ppo.whiten_rewards:
-        assert (
-            args.local_batch_size >= 8
-        ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
-        # raise NotImplementedError("Whitening is not supported at the moment.")
+    # args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
+    # if args.ppo.whiten_rewards:
+    #     assert (
+    #         args.local_batch_size >= 8
+    #     ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
+    #     # raise NotImplementedError("Whitening is not supported at the moment.")
+    if args.local_rollout_forward_batch_size % args.per_device_train_batch_size != 0:
+        warnings.warn("local_rollout_forward_batch_size is not divisible by per_device_train_batch_size (the remainder will be ignored)")
+
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -551,7 +570,7 @@ if __name__ == "__main__":
     dataset, validation_dataset = train_val_split["train"], train_val_split["test"]
     dataset = dataset.with_format("torch", columns=["instruction"])
     dataset = dataset.filter(lambda x: filter_by_length(x, tokenizer, args.task.query_length))
-    dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=args.local_rollout_forward_batch_size, shuffle=True)
     validation_dataset = validation_dataset.with_format("torch", columns=["instruction"])
     validation_dataset = validation_dataset.filter(lambda x: filter_by_length(x, tokenizer, args.task.query_length))
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size)
@@ -786,10 +805,11 @@ if __name__ == "__main__":
 
         stats_shape = (args.ppo.noptepochs)
         metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
+        num_samples = len(query_responses)
         
         for ppo_epoch_idx in range(args.ppo.noptepochs):
-            local_batch_idxs = np.random.permutation(args.local_batch_size)
-            for mini_batch_start in range(0, args.local_batch_size, args.per_device_train_batch_size):
+            local_batch_idxs = np.random.permutation(num_samples)
+            for mini_batch_start in range(0, num_samples, args.per_device_train_batch_size):
                 mini_batch_end = mini_batch_start + args.per_device_train_batch_size
                 mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
                 with accelerator.accumulate(model):
@@ -906,6 +926,8 @@ if __name__ == "__main__":
 
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
+            
+            del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
             torch.cuda.empty_cache()
 
