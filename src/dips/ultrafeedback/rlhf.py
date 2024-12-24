@@ -326,19 +326,16 @@ def truncate_response(args, tokenizer, responses):
     return postprocessed_responses
 
 def force_clear_grads(accelerator, model, optimizer):
+    """
+    Forces accelerate's accumulate() to clear its cached gradients. Called when keeping the gradients are unnecessary
+    between sampling steps.
+    """
     # Exit any no_sync states if they exist
-    if accelerator.distributed_type == DistributedType.DDP:
+    if accelerator.distributed_type == DistributedType.MULTI_GPU:
         if hasattr(model, '_no_sync_context'):
             model._no_sync_context.__exit__(None, None, None)
     
-    # For DeepSpeed, ensure gradient sync is enabled
-    if accelerator.distributed_type == DistributedType.DEEPSPEED:
-        model.enable_gradient_sync()
-    
-    # Clear gradients
     optimizer.zero_grad()
-    
-    # Force CUDA cache cleanup
     torch.cuda.empty_cache()
 
 def forward(model: AutoModelForCausalLM, 
@@ -464,8 +461,8 @@ if __name__ == "__main__":
     #         args.local_batch_size >= 8
     #     ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
     #     # raise NotImplementedError("Whitening is not supported at the moment.")
-    if args.local_rollout_forward_batch_size % args.per_device_train_batch_size != 0:
-        warnings.warn("local_rollout_forward_batch_size is not divisible by per_device_train_batch_size (the remainder will be ignored)")
+    if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) != 0:
+        warnings.warn("local_rollout_forward_batch_size * rloo_k is not divisible by batch_size (gradient accumulation will require memory for the remainder)")
 
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
@@ -569,10 +566,15 @@ if __name__ == "__main__":
     train_val_split = dataset.train_test_split(test_size=0.1, seed=args.seed) # use a consistent seed across runs
     dataset, validation_dataset = train_val_split["train"], train_val_split["test"]
     dataset = dataset.with_format("torch", columns=["instruction"])
-    dataset = dataset.filter(lambda x: filter_by_length(x, tokenizer, args.task.query_length))
+
+    dataset = dataset.filter(filter_by_length,
+                             filter_args = {"tokenizer": tokenizer, "max_length": args.task.query_length})
+    
     dataloader = DataLoader(dataset, batch_size=args.local_rollout_forward_batch_size, shuffle=True)
     validation_dataset = validation_dataset.with_format("torch", columns=["instruction"])
-    validation_dataset = validation_dataset.filter(lambda x: filter_by_length(x, tokenizer, args.task.query_length))
+    validation_dataset = validation_dataset.filter(filter_by_length,
+                                                   filter_args = {"tokenizer": tokenizer, 
+                                                                  "max_length": args.task.query_length})
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size)
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
@@ -930,6 +932,8 @@ if __name__ == "__main__":
             del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
             torch.cuda.empty_cache()
+            if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
+                force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
 
     if args.run_eval:
         eval_storage, eval_df = evaluate(
