@@ -145,7 +145,7 @@ class Args:
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 2
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 16
+    local_rollout_forward_batch_size: int = 8
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k"""
 
     total_episodes: int = int(1e4) # Informs the number of ppo updates to do
@@ -568,12 +568,12 @@ if __name__ == "__main__":
     dataset = dataset.with_format("torch", columns=["instruction"])
 
     dataset = dataset.filter(filter_by_length,
-                             filter_args = {"tokenizer": tokenizer, "max_length": args.task.query_length})
+                             fn_kwargs = {"tokenizer": tokenizer, "max_length": args.task.query_length})
     
     dataloader = DataLoader(dataset, batch_size=args.local_rollout_forward_batch_size, shuffle=True)
     validation_dataset = validation_dataset.with_format("torch", columns=["instruction"])
     validation_dataset = validation_dataset.filter(filter_by_length,
-                                                   filter_args = {"tokenizer": tokenizer, 
+                                                   fn_kwargs = {"tokenizer": tokenizer, 
                                                                   "max_length": args.task.query_length})
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size)
 
