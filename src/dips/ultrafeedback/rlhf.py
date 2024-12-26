@@ -76,7 +76,7 @@ class TaskHParams:
     query_dataset: str = "openbmb/UltraFeedback"
 
     # Response params
-    response_length: int = 256
+    response_length: int = 512
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: Literal["eos"] = "eos"
@@ -91,7 +91,7 @@ class TaskHParams:
 class Args:
     train_dips: bool = True # whether to train via DIPS or RLOO
     disable_wandb: bool = False
-    factor_loss: bool = False
+    factor_loss: bool = True
     debug_tensor_info: bool = False
     loss_full_precision: bool = True
     unembed_full_precision: bool = True
@@ -123,7 +123,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 1e-6
+    lr: float = 3e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -135,18 +135,18 @@ class Args:
     # default args
     batch_size: int = -1
 
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 16
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 4 # number of samples to use for RLOO
+    rloo_k: int = 4 # number of samples to use for RLOO's baseline calculation
     
-    per_device_train_batch_size: int = 2
+    per_device_train_batch_size: int = 1
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 2
+    per_device_eval_batch_size: int = 1
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 8
-    """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k"""
+    local_rollout_forward_batch_size: int = 4
+    """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
     total_episodes: int = int(1e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
@@ -241,7 +241,7 @@ def get_reward(reward_model: nn.Module,
     messages = [[{"role": "user", "content": instruction},
                  {"role": "assistant", "content": response}] for instruction, response in zip(instruction_str, response_str)]
     input_ids = rm_tokenizer.apply_chat_template(messages, return_tensors="pt", padding = True)
-    input_ids = torch.tensor(input_ids).to(device)
+    input_ids = input_ids.to(device)
     attention_mask = input_ids != tokenizer.pad_token_id
     with torch.no_grad():
         output = reward_model(input_ids=input_ids, 
@@ -799,6 +799,8 @@ if __name__ == "__main__":
             rewards[[actual_start, actual_end]] += scores
             writer.add_scalar("generation/seq_len_mean", sequence_lengths.to(torch.float32).mean().item(), update)
             writer.add_scalar("generation/seq_len_std", sequence_lengths.to(torch.float32).std().item(), update)
+            writer.add_scalar("generation/seq_len_max", sequence_lengths.max().item(), update)
+            writer.add_scalar("generation/seq_len_min", sequence_lengths.min().item(), update)
 
             torch.cuda.empty_cache()
 
