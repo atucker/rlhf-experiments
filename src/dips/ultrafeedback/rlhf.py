@@ -231,19 +231,13 @@ def filter_by_length(sample, tokenizer, max_length: int = 256):
     return len(tokenizer(sample["instruction"]).input_ids) <= max_length
 
 def get_reward(reward_model: nn.Module, 
-               instruction_str: List[str],
-               response_str: List[str], 
-               rm_tokenizer: AutoTokenizer) -> torch.Tensor:
+               input_ids: torch.Tensor) -> torch.Tensor:
     """
     Uses the reward model to calculate reward information for the given query_responses.
 
     Returns a scalar reward for each query_response pair.
+    Expected input shape: [batch_size, seq_len] (should include both prompt and response, inc. chat template)
     """
-    messages = [[{"role": "user", "content": instruction},
-                 {"role": "assistant", "content": response}] for instruction, response in zip(instruction_str, response_str)]
-    # ^ necessary to use apply_chat_template
-    input_ids = rm_tokenizer.apply_chat_template(messages, return_tensors="pt", padding = True)
-    input_ids = input_ids.to(device)
     attention_mask = input_ids != tokenizer.pad_token_id
     with torch.no_grad():
         output = reward_model(input_ids=input_ids, 
@@ -322,8 +316,8 @@ def truncate_response(args, tokenizer: AutoTokenizer, responses: torch.Tensor) -
     Truncates responses after the first occurrence of the truncate token.
     """
     trunc_idxs = first_true_indices(responses == args.task.truncate_token_id).unsqueeze(-1)
-    new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
-    idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
+    new_size = [1] * (len(responses.size()) - 1) + [responses.shape[1]]
+    idxs = torch.arange(responses.shape[1], device=responses.device).view(*new_size)
     postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
     return postprocessed_responses
 
@@ -347,21 +341,31 @@ def maybe_use_chat_template(instruction: List[str], use_chat_template: bool, tok
         last_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
         queries = tokenizer.apply_chat_template(messages, 
-                                                padding = "max_length",
-                                                max_length = args.task.query_length,
-                                                truncation = True,
+                                                padding = True,
                                                 return_tensors="pt",
                                                 add_generation_prompt = True,
         )
         tokenizer.padding_side = last_padding_side
-        return queries
+        return queries.to(device)
     else:
         return tokenizer(instruction, 
                          padding="max_length", 
                          max_length=args.task.query_length, 
                          truncation=True,
                          return_tensors="pt",
-        ).input_ids
+        ).input_ids.to(device)
+    
+def get_logprob(logits: torch.Tensor) -> torch.Tensor:
+    logits /= (args.task.temperature + 1e-7)
+    all_logprob = F.log_softmax(logits, dim=-1)
+    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+
+    # Mask out padding tokens (we don't want to calculate KL divergence on them)
+    logprob_mask = postprocessed_response == tokenizer.pad_token_id
+    logprob = torch.masked_fill(logprob, logprob_mask, 0.0)
+    del logits, all_logprob, logprob_mask
+    torch.cuda.empty_cache()
+    return logprob
 
 def forward(model: AutoModelForCausalLM, 
             query_responses: torch.Tensor, 
@@ -441,10 +445,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             # expanded_queries = queries.repeat_interleave(rloo_k, dim=0)
             # postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             score = get_reward(reward_model = reward_model, 
-                                     instruction_str = instruction,
-                                     response_str = tokenizer.batch_decode(postprocessed_responses, skip_special_tokens=True),
-                                     rm_tokenizer = rm_tokenizer)
-            
+                               input_ids = query_responses)
             eval_storage.query_token.extend(queries)
             eval_storage.postprocessed_response_token.extend(postprocessed_responses)
             eval_storage.score.append(score)
@@ -503,6 +504,8 @@ if __name__ == "__main__":
     rm_tokenizer = AutoTokenizer.from_pretrained(
         args.reward_model_path,
         use_fast = True,
+        trust_remote_code = True,
+        padding_side="right"
     )
     # we use the padding token manually but do not resize the token embedding of the model
     if args.task.truncate_token == "eos":
@@ -629,6 +632,7 @@ if __name__ == "__main__":
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
+        eos_token_id = tokenizer.eos_token_id,
     )
     # use the same `0.01` temperature for validation response generation https://github.com/openai/summarize-from-feedback/blob/700967448d10004279f138666442bf1497d0e705/exps/sample.py#L27
     validation_generation_config = GenerationConfig(
@@ -638,6 +642,7 @@ if __name__ == "__main__":
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
+        eos_token_id = tokenizer.eos_token_id,
     )
 
     accelerator.print("===training policy===")
@@ -742,25 +747,22 @@ if __name__ == "__main__":
                 instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
 
-                debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
-                output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
-                logits = output.logits[:, context_length - 1 : -1]
-                logits /= (args.task.temperature + 1e-7)
-                all_logprob = F.log_softmax(logits, dim=-1)
-                logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
-                del output, logits, all_logprob
-                torch.cuda.empty_cache()
-
-                ref_output = forward(accelerator.unwrap_model(model), query_response, tokenizer, ref=True)
-                ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                ref_logits /= args.task.temperature + 1e-7
-                ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
-                del ref_output, ref_logits, ref_all_logprob
-                torch.cuda.empty_cache()
-
                 # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
                 postprocessed_response = truncate_response(args, tokenizer, response)
+                sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
+
+                debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
+                output = forward(accelerator.unwrap_model(model), postprocessed_response, tokenizer)
+                # PAST: we called forward on query_response[:, context_length - 1 : -1] instead of postprocessed response
+                # This was bad because we'd calculate the logprob of a bunch of EOT tokens
+                logits = output.logits
+                logprob = get_logprob(logits)
+                del output, logits
+
+                ref_output = forward(accelerator.unwrap_model(model), postprocessed_response, tokenizer, ref=True)
+                ref_logits = ref_output.logits
+                ref_logprob = get_logprob(ref_logits)
+                del ref_output, ref_logits
 
                 # Response Processing 2. run reward model on the truncated responses
                 repeated_instructions = []
@@ -768,11 +770,8 @@ if __name__ == "__main__":
                     repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
                 decoded_responses = tokenizer.batch_decode(postprocessed_response, skip_special_tokens=True)
                 
-                sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
                 score = get_reward(reward_model = reward_model, 
-                                    instruction_str = repeated_instructions,
-                                    response_str = decoded_responses,
-                                    rm_tokenizer = rm_tokenizer)
+                                input_ids = query_response)
 
                 # Calculate baselines
                 if args.rloo_k > 1:
