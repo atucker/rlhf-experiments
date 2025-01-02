@@ -76,7 +76,7 @@ class TaskHParams:
     query_dataset: str = "openbmb/UltraFeedback"
 
     # Response params
-    response_length: int = 512
+    response_length: int = 1024
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: Literal["eos"] = "eos"
@@ -355,13 +355,15 @@ def maybe_use_chat_template(instruction: List[str], use_chat_template: bool, tok
                          return_tensors="pt",
         ).input_ids.to(device)
     
-def get_logprob(logits: torch.Tensor) -> torch.Tensor:
-    logits /= (args.task.temperature + 1e-7)
+def get_logprob(logits: torch.Tensor,
+                response: torch.Tensor,
+                tokenizer: AutoTokenizer) -> torch.Tensor:
+    logits /= (args.task.temperature + 1e-6)
     all_logprob = F.log_softmax(logits, dim=-1)
     logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
     # Mask out padding tokens (we don't want to calculate KL divergence on them)
-    logprob_mask = postprocessed_response == tokenizer.pad_token_id
+    logprob_mask = response == torch.tensor(tokenizer.pad_token_id, device=response.device, dtype=response.dtype)
     logprob = torch.masked_fill(logprob, logprob_mask, 0.0)
     del logits, all_logprob, logprob_mask
     torch.cuda.empty_cache()
@@ -756,12 +758,16 @@ if __name__ == "__main__":
                 # PAST: we called forward on query_response[:, context_length - 1 : -1] instead of postprocessed response
                 # This was bad because we'd calculate the logprob of a bunch of EOT tokens
                 logits = output.logits
-                logprob = get_logprob(logits)
+                logprob = get_logprob(logits,
+                                      response = postprocessed_response,
+                                      tokenizer = tokenizer)
                 del output, logits
 
                 ref_output = forward(accelerator.unwrap_model(model), postprocessed_response, tokenizer, ref=True)
                 ref_logits = ref_output.logits
-                ref_logprob = get_logprob(ref_logits)
+                ref_logprob = get_logprob(ref_logits,
+                                            response = postprocessed_response,
+                                            tokenizer = tokenizer)
                 del ref_output, ref_logits
 
                 # Response Processing 2. run reward model on the truncated responses
@@ -811,8 +817,10 @@ if __name__ == "__main__":
             # responses not passing that filter will receive a low (fixed) score
             # only query RM on responses that pass that filter
             contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
-            scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
-            accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
+            contain_eos_token = torch.any(postprocessed_responses == tokenizer.eos_token_id, dim=-1)
+            within_max_len = torch.bitwise_or(contain_pad_token, contain_eos_token)
+            scores = torch.where(within_max_len, scores, torch.full_like(scores, args.task.penalty_reward_value))
+            accelerator.print(f"{scores=}, {(within_max_len.sum() / len(within_max_len))=}")
 
             # 4. compute rewards
             kl = logprobs - ref_logprobs # [batch_size, response_len]
@@ -844,22 +852,23 @@ if __name__ == "__main__":
                     # These are all fixed and won't get gradients
                     mb_responses = responses[mini_batch_inds] # [batch_size, response_len]
                     mb_query_responses = query_responses[mini_batch_inds] # [batch_size, seq_len]
+                    mb_postprocessed_responses = postprocessed_responses[mini_batch_inds] # [batch_size, response_len]
                     mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1) # [batch_size]
                     mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
                     mb_reward = scores[mini_batch_inds]
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    debug_tensor_info(mb_query_responses, "mb_query_responses", enabled = args.debug_tensor_info)
-                    output = forward(accelerator.unwrap_model(model), mb_query_responses.clone().detach(), tokenizer)
+                    output = forward(accelerator.unwrap_model(model), mb_postprocessed_responses.clone().detach(), tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
-                    logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
+                    logits = output.logits # logits of response [batch_size, response_len, vocab_size]
                     logits /= (args.task.temperature + 1e-6)
                     new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
                     new_logprobs = torch.sum( # index logprobs over vocab dim by what the model actually generated
-                        torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
+                        torch.gather(new_all_logprobs, 2, mb_postprocessed_responses.unsqueeze(-1)).squeeze(-1), axis=1
                     ) # shape [batch_size] (total logprob of the response)
-
+                    logprob_mask = mb_responses == torch.tensor(tokenizer.pad_token_id, device=device, dtype=mb_responses.dtype)
+                    new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0.0)
                     with torch.amp.autocast(device_type = "cuda",
                                             enabled = not args.loss_full_precision):
                         if args.train_dips:
