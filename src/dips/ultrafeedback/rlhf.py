@@ -285,7 +285,7 @@ def generate(lm_backbone: AutoModelForCausalLM,
         return_dict_in_generate=True,
         num_return_sequences=n_outputs_per_prompt,
         return_legacy_cache = True,
-        pad_token_id = tokenizer.pad_token_id,
+        # output_scores = True,
     )
     expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
@@ -340,9 +340,11 @@ def maybe_use_chat_template(instruction: List[str], use_chat_template: bool, tok
         messages = [[{"role": "user", "content": instruction}] for instruction in instruction]
         # ^ necessary to use apply_chat_template
         queries = tokenizer.apply_chat_template(messages, 
-                                                padding = True,
+                                                padding = "max_length",
                                                 return_tensors="pt",
                                                 add_generation_prompt = True,
+                                                max_length = args.task.query_length,
+                                                truncation = True,
         )
         return queries.to(device)
     else:
@@ -415,6 +417,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
                                               use_chat_template = args.use_chat_template, 
                                               tokenizer = tokenizer)
             context_length = queries.shape[1]
+            assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
 
             # 2. Generate responses using the given policy model
             query_responses = generate(
@@ -473,10 +476,10 @@ if __name__ == "__main__":
     if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) != 0:
         warnings.warn("local_rollout_forward_batch_size * rloo_k is not divisible by batch_size (gradient accumulation will require memory for the remainder)")
 
-    if ("instruct" in args.base_model) and (not args.use_chat_template):
+    if ("instruct" in args.base_model.lower()) and (not args.use_chat_template):
         warnings.warn("You are using an instruct model without chat template. This may lead to unexpected results.")
     
-    if ("instruct" not in args.base_model) and (args.use_chat_template):
+    if ("instruct" not in args.base_model.lower()) and (args.use_chat_template):
         warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results.")
 
     args.ppo.num_updates = args.total_episodes // args.batch_size
@@ -614,7 +617,7 @@ if __name__ == "__main__":
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_length=-1,
-        temperature=(args.task.temperature + 1e-7),
+        temperature=(args.task.temperature + args.eps),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
@@ -624,7 +627,7 @@ if __name__ == "__main__":
     validation_generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_length=-1,
-        temperature=(0.01 + 1e-7),
+        temperature=(0.01 + args.eps),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
@@ -730,6 +733,7 @@ if __name__ == "__main__":
                     n_outputs_per_prompt=args.rloo_k,
                 )
                 context_length = query.shape[1]
+                assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
                 instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
 
@@ -739,9 +743,11 @@ if __name__ == "__main__":
                 sequence_length = first_true_indices(logprob_mask) - 1
 
                 debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
-                output = forward(accelerator.unwrap_model(model), query_response[:, context_length - 1 : -1], tokenizer)
-                logits = output.logits
-                logits /= (args.task.temperature + 1e-6)
+                output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
+                logits = output.logits[:, context_length - 1 : -1]
+                # Pad output sequence to response_length (necessary to avoid shape mismatch across devices)
+                # pad = torch.zeros(logits.shape[0], args.task.response_length-logits.shape[1], dtype = logits.dtype).to(device)
+                logits /= (args.task.temperature + args.eps)
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
@@ -749,9 +755,12 @@ if __name__ == "__main__":
                 logprob = torch.masked_fill(logprob, logprob_mask, 0)
                 del output, logits, all_logprob
 
-                ref_output = forward(accelerator.unwrap_model(model), query_response[:, context_length - 1 : -1], tokenizer, ref=True)
-                ref_logits = ref_output.logits
-                ref_logits /= (args.task.temperature + 1e-6)
+                ref_output = forward(accelerator.unwrap_model(model), query_response, tokenizer, ref=True)
+                ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                # Pad output sequence to response_length (necessary to avoid shape mismatch across devices)
+                # pad = torch.ones(ref_logits.shape[0], args.task.response_length-ref_logits.shape[1], dtype = ref_logits.dtype).to(device)
+                # ref_logits = torch.cat([ref_logits, pad], dim = 1)
+                ref_logits /= (args.task.temperature + args.eps)
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
                 ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
@@ -828,6 +837,7 @@ if __name__ == "__main__":
         stats_shape = (args.ppo.noptepochs)
         metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
         num_samples = len(query_responses)
+        context_length = args.task.query_length
         
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(num_samples)
@@ -845,10 +855,12 @@ if __name__ == "__main__":
                     mb_baseline = baselines[mini_batch_inds]
 
                     # compute the logprobs w/ gradient tracking
-                    output = forward(accelerator.unwrap_model(model), mb_query_responses[:, context_length - 1 : -1].clone().detach(), tokenizer)
+                    output = forward(accelerator.unwrap_model(model), mb_query_responses.clone().detach(), tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
-                    logits = output.logits # logits of response [batch_size, response_len, vocab_size]
-                    logits /= (args.task.temperature + 1e-6)
+                    logits = output.logits[:, context_length - 1 : -1] # logits of response [batch_size, response_len, vocab_size]
+                    # pad = torch.ones(logits.shape[0], args.task.response_length-logits.shape[1], logits.shape[2], dtype = logits.dtype).to(device)
+                    # logits = torch.cat([logits, pad], dim = 1)
+                    logits /= (args.task.temperature + args.eps)
                     new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
                     # index logprobs over vocab dim by what the model actually generated
                     new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
