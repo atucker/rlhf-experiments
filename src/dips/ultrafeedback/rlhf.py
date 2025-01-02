@@ -157,13 +157,13 @@ class Args:
     """The number of processes (GPUs) to use"""
 
     # other args
-    base_model: str = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a16"
+    base_model: str = "meta-llama/Llama-3.1-8B-Instruct"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = "RLHFlow/ArmoRM-Llama3-8B-v0.1"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a16"
+    sft_model_path: str = "meta-llama/Llama-3.1-8B-Instruct"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
@@ -222,7 +222,7 @@ def whiten(values, shift_mean=True):
     # `unbiased=False` matches TF `tf.nn.moments`'s setting
     # Normalize the values to have a mean of 0 (if shift_mean is false) and a variance of 1
     mean, var = torch.mean(values), torch.var(values, unbiased=False)
-    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    whitened = (values - mean) * torch.rsqrt(var + args.eps)
     if not shift_mean:
         whitened += mean
     return whitened
