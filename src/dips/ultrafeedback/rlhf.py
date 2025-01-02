@@ -95,6 +95,7 @@ class Args:
     debug_tensor_info: bool = False
     loss_full_precision: bool = True
     unembed_full_precision: bool = True
+    use_chat_template: bool = True
 
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
@@ -240,6 +241,7 @@ def get_reward(reward_model: nn.Module,
     """
     messages = [[{"role": "user", "content": instruction},
                  {"role": "assistant", "content": response}] for instruction, response in zip(instruction_str, response_str)]
+    # ^ necessary to use apply_chat_template
     input_ids = rm_tokenizer.apply_chat_template(messages, return_tensors="pt", padding = True)
     input_ids = input_ids.to(device)
     attention_mask = input_ids != tokenizer.pad_token_id
@@ -315,7 +317,7 @@ def first_true_indices(bools, dtype=torch.long) -> torch.Tensor:
     return torch.min(zero_or_index, dim=-1).values
 
 
-def truncate_response(args, tokenizer, responses):
+def truncate_response(args, tokenizer: AutoTokenizer, responses: torch.Tensor) -> torch.Tensor:
     """
     Truncates responses after the first occurrence of the truncate token.
     """
@@ -337,6 +339,29 @@ def force_clear_grads(accelerator, model, optimizer):
     
     optimizer.zero_grad()
     torch.cuda.empty_cache()
+
+def maybe_use_chat_template(instruction: List[str], use_chat_template: bool, tokenizer: AutoTokenizer) -> torch.Tensor:
+    if use_chat_template:
+        messages = [[{"role": "user", "content": instruction}] for instruction in instruction]
+        # ^ necessary to use apply_chat_template
+        last_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        queries = tokenizer.apply_chat_template(messages, 
+                                                padding = "max_length",
+                                                max_length = args.task.query_length,
+                                                truncation = True,
+                                                return_tensors="pt",
+                                                add_generation_prompt = True,
+        )
+        tokenizer.padding_side = last_padding_side
+        return queries
+    else:
+        return tokenizer(instruction, 
+                         padding="max_length", 
+                         max_length=args.task.query_length, 
+                         truncation=True,
+                         return_tensors="pt",
+        ).input_ids
 
 def forward(model: AutoModelForCausalLM, 
             query_responses: torch.Tensor, 
@@ -396,12 +421,9 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
         for data in dataloader:
             # 1. Extract queries and reference responses from the dataset
             instruction = data["instruction"]
-            queries = tokenizer(instruction, 
-                                padding="max_length", 
-                                max_length=args.task.query_length, 
-                                truncation=True,
-                                return_tensors="pt")
-            queries = queries.input_ids.to(device)
+            queries = maybe_use_chat_template(instruction, 
+                                              use_chat_template = args.use_chat_template, 
+                                              tokenizer = tokenizer)
             context_length = queries.shape[1]
 
             # 2. Generate responses using the given policy model
@@ -463,6 +485,12 @@ if __name__ == "__main__":
     #     # raise NotImplementedError("Whitening is not supported at the moment.")
     if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) != 0:
         warnings.warn("local_rollout_forward_batch_size * rloo_k is not divisible by batch_size (gradient accumulation will require memory for the remainder)")
+
+    if ("instruct" in args.base_model) and (not args.use_chat_template):
+        warnings.warn("You are using an instruct model without chat template. This may lead to unexpected results.")
+    
+    if ("instruct" not in args.base_model) and (args.use_chat_template):
+        warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results.")
 
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
@@ -596,7 +624,7 @@ if __name__ == "__main__":
     kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
-        min_new_tokens=args.task.response_length,
+        min_length=-1,
         temperature=(args.task.temperature + 1e-7),
         top_k=0.0,
         top_p=1.0,
@@ -605,7 +633,7 @@ if __name__ == "__main__":
     # use the same `0.01` temperature for validation response generation https://github.com/openai/summarize-from-feedback/blob/700967448d10004279f138666442bf1497d0e705/exps/sample.py#L27
     validation_generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
-        min_new_tokens=args.task.response_length,
+        min_length=-1,
         temperature=(0.01 + 1e-7),
         top_k=0.0,
         top_p=1.0,
@@ -690,12 +718,9 @@ if __name__ == "__main__":
 
             # ============ Gathering training samples ============
             instructions = data["instruction"]
-            queries = tokenizer(instructions, 
-                                padding="max_length", 
-                                max_length=args.task.query_length, 
-                                truncation=True,
-                                return_tensors="pt")
-            queries = queries.input_ids.to(device)
+            queries = maybe_use_chat_template(instructions,
+                                            use_chat_template = args.use_chat_template,
+                                            tokenizer = tokenizer)
             context_length = queries.shape[1]
             query_responses = []
             responses = []
@@ -783,9 +808,9 @@ if __name__ == "__main__":
             del (logprob, ref_logprob, score, baseline)
             torch.cuda.empty_cache()
 
-            # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id
+            # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id (doesn't exceed max len)
             # responses not passing that filter will receive a low (fixed) score
-            # only query humans on responses that pass that filter
+            # only query RM on responses that pass that filter
             contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
             scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
             accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
