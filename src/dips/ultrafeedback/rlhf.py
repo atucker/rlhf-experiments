@@ -173,9 +173,9 @@ class Args:
     """Which layers to apply dropout to"""
     output_dir: str = "models/llama_3_8b_armoRM_ultrafeedback"
     """Where to save the model"""
-    lora_rank: int = 8
+    lora_rank: int = 16
     """the rank of the lora matrix"""
-    lora_alpha: int = 16
+    lora_alpha: int = 32
     """weight of lora"""
     lora_dropout: float = 0.0
     """dropout for lora"""
@@ -240,15 +240,16 @@ def get_reward(reward_model: nn.Module,
     Returns a scalar reward for each query_response pair.
     Expected input shape: [batch_size, seq_len] (should include both prompt and response, inc. chat template)
     """
-    attention_mask = input_ids != tokenizer.pad_token_id
     with torch.no_grad():
-        output = reward_model(input_ids=input_ids, 
-                              attention_mask=attention_mask, 
-                              return_dict=True)
-
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return output.score
-
+        scores = []
+        for elem in input_ids:
+            no_pad_input_ids = torch.masked_select(elem, elem != tokenizer.pad_token_id).unsqueeze(0)
+            attention_mask = no_pad_input_ids != tokenizer.pad_token_id
+            output = reward_model(input_ids=no_pad_input_ids, 
+                                attention_mask=attention_mask,
+                                return_dict=True)
+            scores.append(output.score)
+    return torch.cat(scores)
 
 class PrecisionModel(AutoModelForCausalLM):
     def forward(self, *args, **kwargs):
@@ -479,7 +480,7 @@ if __name__ == "__main__":
     #         args.local_batch_size >= 8
     #     ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
     #     # raise NotImplementedError("Whitening is not supported at the moment.")
-    if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) != 0:
+    if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size) != 0:
         warnings.warn("local_rollout_forward_batch_size * rloo_k is not divisible by batch_size (gradient accumulation will require memory for the remainder)")
 
     if ("instruct" in args.base_model.lower()) and (not args.use_chat_template):
