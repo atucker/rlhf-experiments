@@ -74,7 +74,7 @@ class TaskHParams:
     # Query params
     query_length: int = 256 # Filter out queries longer than this
     query_dataset: str = "openbmb/UltraFeedback"
-    chat_template_buffer_length: int = 128
+    chat_template_buffer_length: int = 64
 
     # Response params
     response_length: int = 512
@@ -97,6 +97,7 @@ class Args:
     loss_full_precision: bool = True
     unembed_full_precision: bool = True
     use_chat_template: bool = True
+    calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
 
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
@@ -437,8 +438,9 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             postprocessed_responses = truncate_response(args, tokenizer, responses)
             # expanded_queries = queries.repeat_interleave(rloo_k, dim=0)
             # postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
+            truncated_query_responses = torch.cat([queries, postprocessed_responses], dim = 1)
             score = get_reward(reward_model = reward_model, 
-                               input_ids = query_responses)
+                               input_ids = truncated_query_responses)
             eval_storage.query_token.extend(queries)
             eval_storage.postprocessed_response_token.extend(postprocessed_responses)
             eval_storage.score.append(score)
@@ -620,23 +622,22 @@ if __name__ == "__main__":
     kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
-        min_length=-1,
+        min_new_tokens=args.task.response_length,
         temperature=(args.task.temperature + args.eps),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
-        eos_token_id = tokenizer.eos_token_id,
     )
     # use the same `0.01` temperature for validation response generation https://github.com/openai/summarize-from-feedback/blob/700967448d10004279f138666442bf1497d0e705/exps/sample.py#L27
     validation_generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
-        min_length=-1,
+        min_new_tokens=args.task.response_length,
         temperature=(0.01 + args.eps),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
-        eos_token_id = tokenizer.eos_token_id,
     )
+    # Note: Don't add eos_token_id to the above generation configs - we don't want to avoid generating the eos token.
 
     accelerator.print("===training policy===")
     global_step = 0
@@ -758,8 +759,9 @@ if __name__ == "__main__":
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
-                # Mask out padding tokens (we don't want to calculate KL divergence on them)
-                logprob = torch.masked_fill(logprob, logprob_mask, 0)
+                if args.calculate_kl_on_truncated_responses:
+                    # Mask out padding tokens (we don't want to calculate KL divergence on them)
+                    logprob = torch.masked_fill(logprob, logprob_mask, 0)
                 del output, logits, all_logprob
 
                 ref_output = forward(accelerator.unwrap_model(model), query_response, tokenizer, ref=True)
@@ -771,7 +773,8 @@ if __name__ == "__main__":
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
                 ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
-                ref_logprob = torch.masked_fill(ref_logprob, logprob_mask, 0)
+                if args.calculate_kl_on_truncated_responses:
+                    ref_logprob = torch.masked_fill(ref_logprob, logprob_mask, 0)
                 del ref_output, ref_logits, ref_all_logprob
                 torch.cuda.empty_cache()
 
@@ -779,9 +782,9 @@ if __name__ == "__main__":
                 # repeated_instructions = []
                 # for inst in instruction_batch:
                 #     repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
-                
+                truncated_query_response = torch.cat([query_response[:, :context_length], postprocessed_response], dim = 1)
                 score = get_reward(reward_model = reward_model, 
-                                input_ids = query_response)
+                                input_ids = truncated_query_response)
 
                 # Calculate baselines
                 if args.rloo_k > 1:
@@ -875,8 +878,9 @@ if __name__ == "__main__":
                     # index logprobs over vocab dim by what the model actually generated
                     new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                     # shape [batch_size] (total logprob of the response)
-                    logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
-                    new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
+                    if args.calculate_kl_on_truncated_responses:
+                        logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
+                        new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
                     new_logprobs = torch.sum(new_logprobs, axis=1)
                     with torch.amp.autocast(device_type = "cuda",
                                             enabled = not args.loss_full_precision):
