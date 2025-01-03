@@ -74,6 +74,7 @@ class TaskHParams:
     # Query params
     query_length: int = 256 # Filter out queries longer than this
     query_dataset: str = "openbmb/UltraFeedback"
+    chat_template_buffer_length: int = 128
 
     # Response params
     response_length: int = 512
@@ -124,7 +125,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 3e-6
+    lr: float = 3e-4
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -343,14 +344,14 @@ def maybe_use_chat_template(instruction: List[str], use_chat_template: bool, tok
                                                 padding = "max_length",
                                                 return_tensors="pt",
                                                 add_generation_prompt = True,
-                                                max_length = args.task.query_length,
+                                                max_length = args.task.query_length + args.task.chat_template_buffer_length,
                                                 truncation = True,
         )
         return queries.to(device)
     else:
         return tokenizer(instruction, 
                          padding="max_length", 
-                         max_length=args.task.query_length, 
+                         max_length=args.task.query_length,
                          truncation=True,
                          return_tensors="pt",
         ).input_ids.to(device)
@@ -417,7 +418,10 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
                                               use_chat_template = args.use_chat_template, 
                                               tokenizer = tokenizer)
             context_length = queries.shape[1]
-            assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
+            if args.use_chat_template:
+                assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
+            else:
+                assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
 
             # 2. Generate responses using the given policy model
             query_responses = generate(
@@ -733,7 +737,10 @@ if __name__ == "__main__":
                     n_outputs_per_prompt=args.rloo_k,
                 )
                 context_length = query.shape[1]
-                assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
+                if args.use_chat_template:
+                    assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
+                else:
+                    assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
                 instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
 
@@ -837,7 +844,10 @@ if __name__ == "__main__":
         stats_shape = (args.ppo.noptepochs)
         metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
         num_samples = len(query_responses)
-        context_length = args.task.query_length
+        if args.use_chat_template:
+            context_length = args.task.query_length + args.task.chat_template_buffer_length
+        else:
+            context_length = args.task.query_length
         
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(num_samples)
