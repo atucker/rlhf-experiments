@@ -42,7 +42,7 @@ import random
 import warnings
 
 # Package imports
-from dips.utils import set_seed, get_grad_norms
+from dips.tldr.utils import set_seed, get_grad_norms
 
 wandb.login(key=os.environ["WANDB_API_KEY"])
 

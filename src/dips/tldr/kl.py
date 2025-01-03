@@ -39,8 +39,8 @@ from peft import get_peft_model, LoraConfig
 import random
 
 # Package imports
-from dips.utils import set_seed, get_grad_norms
-from dips.parse import Args, TaskHParams, PpoHParams, RewardHParams, AdaptiveKLParams, validate_args
+from dips.tldr.utils import set_seed, get_grad_norms
+from dips.tldr.parse import Args, TaskHParams, PpoHParams, RewardHParams, AdaptiveKLParams, validate_args
 
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
@@ -180,6 +180,7 @@ def generate(lm_backbone: AutoModelForCausalLM,
         generation_config=generation_config,
         return_dict_in_generate=True,
         num_return_sequences=n_outputs_per_prompt,
+        eos_token_id=tokenizer.eos_token_id,
     )
     expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
