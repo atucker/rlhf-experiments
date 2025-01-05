@@ -74,7 +74,7 @@ class TaskHParams:
     # Query params
     query_length: int = 256 # Filter out queries longer than this
     query_dataset: str = "openbmb/UltraFeedback"
-    chat_template_buffer_length: int = 128
+    chat_template_buffer_length: int = 64
 
     # Response params
     response_length: int = 512
@@ -82,10 +82,13 @@ class TaskHParams:
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: Literal["eos"] = "eos"
     truncate_token_id: Optional[int] = None
-    penalty_reward_value: int = -1
+    penalty_reward_value: int = -4
 
     # LM params
     temperature: float = 0.5
+
+    # Reward scaling
+    reward_coef: float = 1.0
 
 
 @dataclass
@@ -125,7 +128,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 3e-4
+    lr: float = 5e-5
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -137,20 +140,20 @@ class Args:
     # default args
     batch_size: int = -1
 
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 4 # number of samples to use for RLOO's baseline calculation
+    rloo_k: int = 1 # number of samples to use for RLOO's baseline calculation
     
     per_device_train_batch_size: int = 1
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 1
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 4
+    local_rollout_forward_batch_size: int = 16
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
-    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
+    total_episodes: int = int(4e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
@@ -172,9 +175,9 @@ class Args:
     """Which layers to apply dropout to"""
     output_dir: str = "models/llama_3_8b_armoRM_ultrafeedback"
     """Where to save the model"""
-    lora_rank: int = 8
+    lora_rank: int = 64
     """the rank of the lora matrix"""
-    lora_alpha: int = 16
+    lora_alpha: int = 64
     """weight of lora"""
     lora_dropout: float = 0.0
     """dropout for lora"""
@@ -816,6 +819,9 @@ if __name__ == "__main__":
             baselines = torch.cat(baselines, 0)
             del (logprob, ref_logprob, score, baseline)
             torch.cuda.empty_cache()
+
+            # scale RM scores
+            scores = scores * args.task.reward_coef
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id (doesn't exceed max len)
             # responses not passing that filter will receive a low (fixed) score
