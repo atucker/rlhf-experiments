@@ -55,7 +55,7 @@ class AdaptiveKLParams:
 class RewardHParams:
     use_adaptive_kl: bool = False
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    kl_coef: float = 0.05
+    kl_coef: float = 5e-3
 
 @dataclass
 class PpoHParams:
@@ -88,7 +88,7 @@ class TaskHParams:
     temperature: float = 0.5
 
     # Reward scaling
-    reward_coef: float = 1.0
+    reward_coef: float = 4.0
 
 
 @dataclass
@@ -143,7 +143,7 @@ class Args:
     # default args
     batch_size: int = -1
 
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
@@ -164,13 +164,13 @@ class Args:
     """The number of processes (GPUs) to use"""
 
     # other args
-    base_model: str = "meta-llama/Llama-3.1-8B-Instruct"
+    base_model: str = "meta-llama/Llama-3.1-8B"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = "RLHFlow/ArmoRM-Llama3-8B-v0.1"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "meta-llama/Llama-3.1-8B-Instruct"
+    sft_model_path: str = "meta-llama/Llama-3.1-8B"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
@@ -560,7 +560,8 @@ if __name__ == "__main__":
         args.reward_model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
+        device_map = device,
+        # low_cpu_mem_usage=True,
     )
     if accelerator.is_main_process:
         pprint(model_config)
