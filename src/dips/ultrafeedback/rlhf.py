@@ -170,7 +170,7 @@ class Args:
     """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = "RLHFlow/ArmoRM-Llama3-8B-v0.1"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "meta-llama/Llama-3.1-8B"
+    sft_model_path: str = "meta-llama/Llama-3.1-8B-Instruct"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
