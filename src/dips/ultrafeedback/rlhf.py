@@ -77,7 +77,7 @@ class TaskHParams:
     chat_template_buffer_length: int = 64
 
     # Response params
-    response_length: int = 512
+    response_length: int = 1024
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: Literal["eos"] = "eos"
@@ -93,12 +93,12 @@ class TaskHParams:
 
 @dataclass
 class Args:
-    train_dips: bool = True # whether to train via DIPS or RLOO
+    train_dips: bool = False # whether to train via DIPS or RLOO
     disable_wandb: bool = False
-    factor_loss: bool = True
+    factor_loss: bool = False
     debug_tensor_info: bool = False
-    loss_full_precision: bool = True
-    unembed_full_precision: bool = True
+    loss_full_precision: bool = False
+    unembed_full_precision: bool = False
     use_chat_template: bool = True
     calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
 
@@ -151,7 +151,7 @@ class Args:
     
     per_device_train_batch_size: int = 1
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 1
+    per_device_eval_batch_size: int = 16
     """per rank eval batch size"""
     local_rollout_forward_batch_size: int = 16
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
@@ -164,7 +164,7 @@ class Args:
     """The number of processes (GPUs) to use"""
 
     # other args
-    base_model: str = "meta-llama/Llama-3.1-8B"
+    base_model: str = "meta-llama/Llama-3.1-8B-Instruct"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
