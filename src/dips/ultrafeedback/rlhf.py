@@ -101,6 +101,7 @@ class Args:
     unembed_full_precision: bool = False
     use_chat_template: bool = True
     calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
+    clip_grad_norm: Optional[float] = 1.0
 
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
@@ -920,7 +921,6 @@ if __name__ == "__main__":
                             weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
                             loss = torch.mean(-1*new_logprobs * weighting)
 
-
                     # Grab model grad norms
                     if args.train_dips and args.factor_loss:
                         policy_term_grad_norms = get_grad_norms(loss = policy_loss_term,
@@ -935,8 +935,9 @@ if __name__ == "__main__":
                                                 device = device)
 
                     accelerator.backward(loss, retain_graph = True) # retain graph to save intermediate grad norms
-                    #accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    
+                    if args.clip_grad_norm is not None:
+                        accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+
                     optimizer.step()
                     optimizer.zero_grad()
 
