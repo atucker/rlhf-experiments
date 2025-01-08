@@ -101,7 +101,8 @@ class Args:
     unembed_full_precision: bool = False
     use_chat_template: bool = True
     calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
-    clip_grad_norm: Optional[float] = 1.0
+    clip_grad_norm: Optional[float] = None
+    force_clear_grad_optim: bool = False # an optimization to reduce GPU memory usage. May mess with gradient clipping.
 
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
@@ -148,7 +149,7 @@ class Args:
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 1 # number of samples to use for RLOO's baseline calculation
+    rloo_k: int = 2 # number of samples to use for RLOO's baseline calculation
     
     per_device_train_batch_size: int = 1
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
@@ -157,7 +158,7 @@ class Args:
     local_rollout_forward_batch_size: int = 16
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
-    total_episodes: int = int(4e4) # Informs the number of ppo updates to do
+    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
@@ -478,8 +479,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps,
-                              kwargs_handlers = [DistributedDataParallelKwargs(find_unused_parameters = True)]) 
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps) 
     #                           ^ Necessary for the policy-value wrapper trick we pull
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
     set_seed(local_seed)
@@ -934,8 +934,8 @@ if __name__ == "__main__":
                                                 params = param_subset, 
                                                 device = device)
 
-                    accelerator.backward(loss, retain_graph = True) # retain graph to save intermediate grad norms
-                    if args.clip_grad_norm is not None:
+                    accelerator.backward(loss)
+                    if args.clip_grad_norm is not None and accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
 
                     optimizer.step()
@@ -998,8 +998,9 @@ if __name__ == "__main__":
             del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
             torch.cuda.empty_cache()
-            if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
-                force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
+            if args.force_clear_grad_optim:
+                if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
+                    force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
 
     if args.run_eval:
         eval_storage, eval_df = evaluate(
