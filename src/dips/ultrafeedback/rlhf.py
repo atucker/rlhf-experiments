@@ -102,7 +102,7 @@ class Args:
     use_chat_template: bool = True
     calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
     clip_grad_norm: Optional[float] = None
-    force_clear_grad_optim: bool = False # an optimization to reduce GPU memory usage. May mess with gradient clipping.
+    force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
 
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
@@ -158,7 +158,7 @@ class Args:
     local_rollout_forward_batch_size: int = 16
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
-    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
+    total_episodes: int = int(3208) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
