@@ -158,7 +158,7 @@ class Args:
     local_rollout_forward_batch_size: int = 16
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
-    total_episodes: int = int(3208) # Informs the number of ppo updates to do
+    total_episodes: int = int(6416) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
