@@ -145,17 +145,17 @@ class Args:
     # default args
     batch_size: int = -1
 
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
     rloo_k: int = 2 # number of samples to use for RLOO's baseline calculation
     
-    per_device_train_batch_size: int = 1
+    per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 16
+    per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 16
+    local_rollout_forward_batch_size: int = 4
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
     total_episodes: int = int(6416) # Informs the number of ppo updates to do
@@ -499,7 +499,16 @@ if __name__ == "__main__":
         warnings.warn("You are using an instruct model without chat template. This may lead to unexpected results.")
     
     if ("instruct" not in args.base_model.lower()) and (args.use_chat_template):
-        warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results.")
+        warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results; the tokenization scheme between the instruct model and the base model may be different.")
+
+    train_is_multi_batch = args.per_device_train_batch_size != 1
+    eval_is_multi_batch = (args.rloo_k * args.local_rollout_forward_batch_size) != 1
+    
+    if args.train_dips:
+        assert train_is_multi_batch == eval_is_multi_batch, """One of your training or evaluation batch sizes is 1 while the other is not.
+        It's a known issue that huggingface models generate slightly different logits depending on batch size. While this difference is slight,
+        it completely breaks the probability weighting ratio for DIPS. For Llama-8b, all batch sizes != 1 have identical behavior.
+        """
 
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
