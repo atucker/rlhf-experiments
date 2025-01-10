@@ -914,7 +914,7 @@ if __name__ == "__main__":
                         if args.train_dips:
                             # the IPS trick loss
                             approx_kl = new_logprobs - mb_ref_logprobs
-                            prob_ratio = torch.exp(new_logprobs - mb_logprobs)
+                            prob_ratio = torch.exp(new_logprobs - (new_logprobs.clone().detach()))
                             weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
 
                             if args.factor_loss:
