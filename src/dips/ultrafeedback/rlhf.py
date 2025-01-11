@@ -103,6 +103,7 @@ class Args:
     calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
+    kl_grad_patch: bool = False
 
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
@@ -501,14 +502,18 @@ if __name__ == "__main__":
     if ("instruct" not in args.base_model.lower()) and (args.use_chat_template):
         warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results; the tokenization scheme between the instruct model and the base model may be different.")
 
+    if args.kl_grad_patch:
+        assert not args.train_dips, "KL grad patch is only supported for RLOO training"
+
     train_is_multi_batch = args.per_device_train_batch_size != 1
     eval_is_multi_batch = (args.rloo_k * args.local_rollout_forward_batch_size) != 1
     
     if args.train_dips:
-        assert train_is_multi_batch == eval_is_multi_batch, """One of your training or evaluation batch sizes is 1 while the other is not.
+        if train_is_multi_batch != eval_is_multi_batch:
+            warnings.warn("""One of your training or evaluation batch sizes is 1 while the other is not.
         It's a known issue that huggingface models generate slightly different logits depending on batch size. While this difference is slight,
         it completely breaks the probability weighting ratio for DIPS. For Llama-8b, all batch sizes != 1 have identical behavior.
-        """
+        """)
 
     args.ppo.num_updates = args.total_episodes // args.batch_size
 
@@ -914,7 +919,7 @@ if __name__ == "__main__":
                         if args.train_dips:
                             # the IPS trick loss
                             approx_kl = new_logprobs - mb_ref_logprobs
-                            prob_ratio = torch.exp(new_logprobs - (new_logprobs.clone().detach()))
+                            prob_ratio = torch.exp(new_logprobs - mb_logprobs)
                             weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
 
                             if args.factor_loss:
@@ -929,6 +934,10 @@ if __name__ == "__main__":
                             approx_kl = mb_logprobs - mb_ref_logprobs
                             weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
                             loss = torch.mean(-1*new_logprobs * weighting)
+                            if args.kl_grad_patch:
+                                differentiable_kl = new_logprobs - mb_ref_logprobs
+                                diff_reward = (mb_reward - mb_baseline - kl_ctl.value * differentiable_kl)
+                                loss = loss + torch.mean(-1 * diff_reward)
 
                     # Grab model grad norms
                     if args.train_dips and args.factor_loss:
