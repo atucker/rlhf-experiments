@@ -85,7 +85,7 @@ class TaskHParams:
     penalty_reward_value: int = -4
 
     # LM params
-    temperature: float = 0.5
+    temperature: float = 0.75
 
     # Reward scaling
     reward_coef: float = 4.0
@@ -100,7 +100,7 @@ class Args:
     loss_full_precision: bool = False
     unembed_full_precision: bool = False
     use_chat_template: bool = True
-    calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
+    calculate_kl_on_truncated_responses: bool = True # recommended: False. See discussion in #rlhf.
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
     kl_grad_patch: bool = False
@@ -146,7 +146,7 @@ class Args:
     # default args
     batch_size: int = -1
 
-    gradient_accumulation_steps: int = 4
+    gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
