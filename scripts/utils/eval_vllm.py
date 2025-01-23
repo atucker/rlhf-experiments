@@ -2,7 +2,7 @@ import argparse
 from typing import List, Dict, Any
 import json
 from vllm import LLM, SamplingParams
-import openai
+from openai import OpenAI
 from tqdm import tqdm
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
@@ -10,10 +10,15 @@ import logging
 from datasets import load_dataset
 import torch
 import os
+from torch import multiprocessing
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+multiprocessing.set_start_method('spawn', force=True)
 
+client = OpenAI(
+    api_key = os.environ.get("OPENAI_API_KEY"),
+)
 def setup_torch_compile():
     """Configure torch compilation settings."""
     torch._dynamo.config.suppress_errors = True
@@ -37,7 +42,8 @@ def setup_vllm_model(model_path: str, tensor_parallel_size: int = 1) -> LLM:
     return LLM(
         model=model_path,
         tensor_parallel_size=tensor_parallel_size,
-        trust_remote_code=True
+        trust_remote_code=True,
+        gpu_memory_utilization=0.45,
     )
 
 def load_prompts(prompt_file: str) -> List[str]:
@@ -78,7 +84,7 @@ def get_eval_judgement(prompt: str, response_a: str, response_b: str, model: str
     """Get OpenAI model judgment on which response is better."""
     comparison_messages = get_comparison_messages(prompt, response_a, response_b)
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model=model,
             messages=comparison_messages,
             temperature=0.0,
