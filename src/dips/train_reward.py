@@ -9,6 +9,7 @@ import os
 from accelerate import Accelerator
 import wandb
 from tqdm import tqdm
+import argparse
 
 
 
@@ -88,7 +89,7 @@ class Model(torch.nn.Module):
     REWARD_ADAPTER_NAME = "reward"
     EXPERT_ADAPTER_NAME = "expert"
 
-    def __init__(self, model_name, accelerator, expert_adapter='', dtype=torch.bfloat16):
+    def __init__(self, model_name, accelerator, beta=0.1, expert_adapter='', dtype=torch.bfloat16):
         super().__init__()
         self.accelerator = accelerator
         
@@ -96,10 +97,10 @@ class Model(torch.nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", padding_side="left")
         self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
-        peft_config = LoraConfig(r=8, lora_alpha=64, lora_dropout=0.1)
+        peft_config = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.1)
         self._model = get_peft_model(self._model, peft_config, self.POLICY_ADAPTER_NAME)
 
-        self.beta = 0.1
+        self.beta = beta
         self.temperature = 1
 
         if expert_adapter:
@@ -155,14 +156,31 @@ class Model(torch.nn.Module):
 
 
 if __name__ == "__main__":
-    MAX_PROMPT_LENGTH = 256
-    MAX_RESPONSE_LENGTH = 1024
-    GENERATE_BATCH_SIZE = 8
-    GRAD_BATCH_SIZE = 4
-    UPDATE_BATCH_SIZE = 64
+    MAX_PROMPT_LENGTH = 356
+    MAX_RESPONSE_LENGTH = 156
     SAVE_FREQ = 5000
     MAX_GRAD_NORM = 10.0
     #N_TRAIN = 60000
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--outdir', default="test")
+    parser.add_argument('--beta', type=float, default=0.1)
+    parser.add_argument('--lr', type=float, default=2e-5)
+    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument(
+        '--step', 
+        choices=['sft', 'reward'],  # Only these values are allowed
+        default='reward',
+        help='step to train'
+    )
+    # two H100s
+    parser.add_argument('--grad_batch_size', type=int, default=2)
+    parser.add_argument('--update_batch_size', type=int, default=64)
+    parser.add_argument('--bfloat16', action='store_true', help='Use bfloat16')
+    parser.add_argument('--instruct_base', action='store_true', help='Use the instruct model')
+    args = parser.parse_args()
+
+    assert args.update_batch_size % args.grad_batch_size == 0
+
     wandb.init(
         project="8b-demo",
         name="train_expert"
@@ -170,7 +188,8 @@ if __name__ == "__main__":
     
     dataset = load_dataset("openbmb/UltraFeedback")
     #model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B-Instruct").to(DEVICE)
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", padding_side="left")
+    model_name = "meta-llama/Llama-3.1-8B-Instruct" if args.instruct_base else "meta-llama/Llama-3.1-8B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     
     prompt_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="longest")
@@ -179,52 +198,63 @@ if __name__ == "__main__":
     dataset = dataset.filter(length_filter)
     dataloader = DataLoader(
         dataset["train"].map(process_prompts, batched=False, remove_columns=dataset["train"].column_names),
-        batch_size=GRAD_BATCH_SIZE, collate_fn=collate_fn, shuffle=True
+        batch_size=args.grad_batch_size, collate_fn=collate_fn, shuffle=True
     )
 
     accelerator = Accelerator()
-    model = Model("meta-llama/Llama-3.1-8B-Instruct", accelerator)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-7)
+    model = Model(model_name, accelerator, beta=args.beta)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
     warmup = len(dataloader) / 10
     scheduler = LambdaLR(optimizer, lambda step: min(1, step / warmup))
     model, optimizer, scheduler, dataloader = accelerator.prepare(model, optimizer, scheduler, dataloader)
+
+    os.makedirs(args.outdir, exist_ok=True)
+    with open(f"{args.outdir}/base_model.txt", "w") as f:
+        f.write(model_name)
 
     n = 0
     save_n = 0
 
     accelerator.unwrap_model(model).train()
     log_data = {}
-    for batch in tqdm(dataloader):
-        #batch = to_device(batch, DEVICE)
-        chosen, rejected = split_dicts(batch, ['chosen', 'rejected'], unpack=True)
-        chosen_reward = accelerator.unwrap_model(model).reward(chosen)
-        rejected_reward = accelerator.unwrap_model(model).reward(rejected)
-        loss = -1 * torch.nn.functional.logsigmoid(chosen_reward - rejected_reward)
-        assert len(loss.shape) == 1
-        assert UPDATE_BATCH_SIZE % loss.shape[0] == 0
-        n += loss.shape[0] * accelerator.num_processes
+    for epoch in range(args.epochs):
+        for batch in tqdm(dataloader):
+            #batch = to_device(batch, DEVICE)
+            chosen, rejected = split_dicts(batch, ['chosen', 'rejected'], unpack=True)
+            if args.step == "reward":
+                chosen_reward = accelerator.unwrap_model(model).reward(chosen)
+                rejected_reward  = accelerator.unwrap_model(model).reward(rejected)
+                loss = -1 * torch.nn.functional.logsigmoid(chosen_reward - rejected_reward)
+                log = {
+                    'loss': loss.detach(),
+                    'chosen_reward': chosen_reward.detach(),
+                    'rejected_reward': rejected_reward.detach(),
+                    'accuracy': (chosen_reward > rejected_reward).detach()
+                }
+            elif args.step == "sft":
+                loss = -1 * accelerator.unwrap_model(model)._logprobs(chosen)
+                log = {'loss': loss.detach()}
+            assert len(loss.shape) == 1
+            assert args.update_batch_size % loss.shape[0] == 0
+            n += loss.shape[0] * accelerator.num_processes
+        
+            accelerator.backward(torch.mean(loss))
+        
+            log_data = accumulate_dict(log_data, log)
+        
+            if n % args.update_batch_size == 0:
+                log_data = reduce_dict(gather_dict(accelerator, log_data))
+                if accelerator.is_main_process:
+                    wandb.log(log_data)
     
-        accelerator.backward(torch.mean(loss))
+                accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+                log_data = {}
     
-        log_data = accumulate_dict(log_data, {
-            'loss': loss.detach(),
-            'chosen_reward': chosen_reward.detach(),
-            'rejected_reward': rejected_reward.detach(),
-            'accuracy': (chosen_reward > rejected_reward).detach()
-        })
-    
-        if n % UPDATE_BATCH_SIZE == 0:
-            log_data = reduce_dict(gather_dict(accelerator, log_data))
-            if accelerator.is_main_process:
-                wandb.log(log_data)
-
-            accelerator.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-            log_data = {}
-
-        if n > save_n:
-            save_n += SAVE_FREQ
-            accelerator.unwrap_model(model).save(f'test/checkpoints/{n}')
-    accelerator.unwrap_model(model).save(f'expert')
+            if n > save_n:
+                save_n += SAVE_FREQ
+                accelerator.unwrap_model(model).save(f'{args.outdir}/checkpoints/{epoch}/{n}')
+        accelerator.unwrap_model(model).save(f'{args.outdir}/epochs/{epoch}')
+    accelerator.unwrap_model(model).save(f'{args.outdir}/final')
