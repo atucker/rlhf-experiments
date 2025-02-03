@@ -180,7 +180,7 @@ def generate(lm_backbone: AutoModelForCausalLM,
         generation_config=generation_config,
         return_dict_in_generate=True,
         num_return_sequences=n_outputs_per_prompt,
-        eos_token_id=tokenizer.eos_token_id,
+        # eos_token_id=tokenizer.eos_token_id,
     )
     expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
@@ -506,7 +506,7 @@ if __name__ == "__main__":
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
-        temperature=(args.task.temperature + 1e-7),
+        temperature=(args.task.temperature + args.eps),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
@@ -515,11 +515,12 @@ if __name__ == "__main__":
     validation_generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
-        temperature=(0.01 + 1e-7),
+        temperature=(0.01 + args.eps),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
     )
+    # Note: Don't add eos_token_id to the above generation configs - we don't want to avoid generating the eos token.
 
     accelerator.print("===training policy===")
     global_step = 0
@@ -624,7 +625,7 @@ if __name__ == "__main__":
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
                 print(f"output dtype: {output.logits.dtype}")
                 logits = output.logits[:, context_length - 1 : -1]
-                logits /= (args.task.temperature + 1e-7)
+                logits /= (args.task.temperature + args.eps)
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                 del output, logits, all_logprob
@@ -632,7 +633,7 @@ if __name__ == "__main__":
 
                 ref_output = forward(accelerator.unwrap_model(model), query_response, tokenizer, ref=True)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                ref_logits /= args.task.temperature + 1e-7
+                ref_logits /= args.task.temperature + args.eps
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
                 ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                 del ref_output, ref_logits, ref_all_logprob
@@ -711,11 +712,12 @@ if __name__ == "__main__":
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
 
         stats_shape = (args.ppo.noptepochs)
+        num_samples = len(query_responses)
         metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
         
         for ppo_epoch_idx in range(args.ppo.noptepochs):
-            local_batch_idxs = np.random.permutation(args.local_batch_size)
-            for mini_batch_start in range(0, args.local_batch_size, args.per_device_train_batch_size):
+            local_batch_idxs = np.random.permutation(num_samples)
+            for mini_batch_start in range(0, num_samples, args.per_device_train_batch_size):
                 mini_batch_end = mini_batch_start + args.per_device_train_batch_size
                 mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
                 with accelerator.accumulate(policy):
@@ -731,7 +733,7 @@ if __name__ == "__main__":
                     output = forward(model, mb_query_responses, tokenizer)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length-1:-1] # logits of response [batch_size, response_len, vocab_size]
-                    logits /= (args.task.temperature + 1e-7)
+                    logits /= (args.task.temperature + args.eps)
                     new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
                     new_logprobs = torch.sum( # index logprobs over vocab dim by what the model actually generated
                         torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1), axis=1
@@ -746,8 +748,8 @@ if __name__ == "__main__":
                             weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
 
                             if args.factor_loss:
-                                policy_loss_term = -1 * (prob_ratio * weighting.detach()).mean()
-                                kl_loss_term = -1 * (prob_ratio.detach() * weighting).mean()
+                                policy_loss_term = -0.5 * (prob_ratio * weighting.detach()).mean()
+                                kl_loss_term = -0.5 * (prob_ratio.detach() * weighting).mean()
                                 loss = policy_loss_term + kl_loss_term
                             else:
                                 loss = torch.mean(-1 * prob_ratio * weighting)
@@ -757,7 +759,10 @@ if __name__ == "__main__":
                             approx_kl = mb_logprobs - mb_ref_logprobs
                             weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
                             loss = torch.mean(-1*new_logprobs * weighting)
-
+                            if args.kl_grad_patch:
+                                differentiable_kl = new_logprobs - mb_ref_logprobs
+                                diff_reward = (mb_reward - mb_baseline - kl_ctl.value * differentiable_kl)
+                                loss = loss + torch.mean(-1 * diff_reward)
 
                     # Grab model grad norms
                     if args.train_dips and args.factor_loss:
@@ -771,7 +776,7 @@ if __name__ == "__main__":
                     grad_norms = get_grad_norms(loss = loss,
                                                 params = param_subset, 
                                                 device = device)
-                    accelerator.backward(loss, retain_graph = True) # retain graph to save intermediate grad norms
+                    accelerator.backward(loss) # retain graph to save intermediate grad norms
                     #accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     
                     optimizer.step()
@@ -790,8 +795,8 @@ if __name__ == "__main__":
                             metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
                             metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
                             if args.factor_loss:
-                                metrics["policy_loss_term"][ppo_epoch_idx] += policy_loss_term
-                                metrics["kl_loss_term"][ppo_epoch_idx] += kl_loss_term
+                                # No need to log kl and policy grad norms - they're both the same as the loss.
+                                # The distinction is in the gradient flow.
                                 metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
                                 metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
                                 metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()

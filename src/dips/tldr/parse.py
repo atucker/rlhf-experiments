@@ -46,10 +46,12 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
-    disable_wandb: bool = False
+    disable_wandb: bool = True
     factor_loss: bool = False
     loss_full_precision: bool = True
     unembed_full_precision: bool = True
+    kl_grad_patch: bool = False
+
     # common args
     exp_name: str = "pythia"
     """the name of this experiment"""
@@ -86,20 +88,20 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 4 # number of samples to use for RLOO
+    rloo_k: int = 2 # number of samples to use for RLOO
     
     per_device_train_batch_size: int = 8
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 8
+    local_rollout_forward_batch_size: int = 32
     """per rank no grad forward pass in the rollout phase"""
 
-    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
+    total_episodes: int = int(2e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
@@ -135,3 +137,6 @@ def validate_args(args: Args):
     if args.factor_loss:
         assert args.train_dips, "Loss factoring only supports DIPS. Are you using --train_dips?"
     assert args.rloo_k >= 1
+
+    if args.kl_grad_patch:
+        assert not args.train_dips, "KL grad patch is only supported for RLOO training"
