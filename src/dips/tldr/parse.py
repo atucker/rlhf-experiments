@@ -46,7 +46,7 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
-    disable_wandb: bool = True
+    disable_wandb: bool = False
     factor_loss: bool = False
     loss_full_precision: bool = True
     unembed_full_precision: bool = True
@@ -101,7 +101,7 @@ class Args:
     local_rollout_forward_batch_size: int = 32
     """per rank no grad forward pass in the rollout phase"""
 
-    total_episodes: int = int(2e4) # Informs the number of ppo updates to do
+    total_episodes: int = int(1e4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
