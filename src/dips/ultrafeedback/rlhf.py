@@ -923,9 +923,9 @@ if __name__ == "__main__":
                             weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
 
                             if args.factor_loss:
-                                policy_loss_term = -0.5 * (prob_ratio * weighting.detach()).mean()
-                                kl_loss_term = -0.5 * (prob_ratio.detach() * weighting).mean()
-                                loss = policy_loss_term + kl_loss_term
+                                policy_loss_term = (prob_ratio * weighting.detach()).mean()
+                                kl_loss_term = (prob_ratio.detach() * weighting).mean()
+                                loss = -1 * (policy_loss_term + kl_loss_term)
                             else:
                                 loss = torch.mean(-1 * prob_ratio * weighting)
 
