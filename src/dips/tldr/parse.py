@@ -48,8 +48,8 @@ class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
     disable_wandb: bool = False
     factor_loss: bool = False
-    loss_full_precision: bool = True
-    unembed_full_precision: bool = True
+    loss_full_precision: bool = False
+    unembed_full_precision: bool = False
     kl_grad_patch: bool = False
 
     # common args
@@ -75,6 +75,8 @@ class Args:
     """How often to print sample output"""
     run_eval: bool = True
     """Whether to run evaluation"""
+    max_eval_size: int = 100
+    """Maximum number of samples to generate once per print_sample_output_freq (set < 100 for fast evaluation)"""
 
     # optimizer args
     eps: float = 1e-5

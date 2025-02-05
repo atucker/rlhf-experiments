@@ -258,7 +258,8 @@ class PrecisionModel(AutoModelForCausalLM):
         return logits
 
 def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: AutoTokenizer,
-             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True) -> Tuple[EvalStorage, pd.DataFrame]:
+             dataloader: DataLoader, generation_config: GenerationConfig, sampling=True,
+             max_eval_size: int = float('inf')) -> Tuple[EvalStorage, pd.DataFrame]:
     """
     Completes an episode rollout for the policy model and returns:
 
@@ -266,9 +267,10 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
     - policy-generated response and policy-generated response performance
     - kl divergence between the policy and reference model
     """
+
     eval_storage = EvalStorage()
     with torch.no_grad():
-        for data in dataloader:
+        for sample_idx, data in enumerate(dataloader):
             # 1. Extract queries and reference responses from the dataset
             queries = data["query_token"]
             reference_response_token = data["reference_response_token"]
@@ -339,6 +341,9 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             eval_storage.kl.append(kl)
 
             if sampling:
+                break
+
+            if sample_idx >= max_eval_size:
                 break
 
     eval_storage.query = tokenizer.batch_decode(eval_storage.query_token, skip_special_tokens=True)
@@ -542,6 +547,7 @@ if __name__ == "__main__":
                 tokenizer,
                 validation_dataloader,
                 validation_generation_config,
+                sampling = True,
                 # rloo_k = args.rloo_k,
             )
             validation_score = eval_storage.score[0]
@@ -564,6 +570,7 @@ if __name__ == "__main__":
                         validation_dataloader,
                         validation_generation_config,
                         sampling=False,
+                        max_eval_size = args.max_eval_size,
                     )
                     if accelerator.is_main_process:
                         eval_df.to_csv(f"runs/{run_name}/table.csv")
@@ -846,7 +853,8 @@ if __name__ == "__main__":
             tokenizer,
             validation_dataloader,
             validation_generation_config,
-            sampling=False
+            sampling=False,
+            max_eval_size = args.max_eval_size,
         )
         if accelerator.is_main_process:
             eval_df.to_csv(f"runs/{run_name}/table.csv")
