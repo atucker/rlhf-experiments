@@ -712,7 +712,8 @@ if __name__ == "__main__":
         stats_shape = (args.ppo.noptepochs)
         num_samples = len(query_responses)
         metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
-        
+        num_minibatches = num_samples // args.per_device_train_batch_size
+
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(num_samples)
             for mini_batch_start in range(0, num_samples, args.per_device_train_batch_size):
@@ -782,30 +783,30 @@ if __name__ == "__main__":
 
                 with torch.no_grad():
                     # Do whatever logging we want
-                    metrics["loss"][ppo_epoch_idx] += accelerator.gather(loss.detach()).mean()
-                    metrics["baseline"][ppo_epoch_idx] += accelerator.gather(mb_baseline).mean()
-                    metrics["grad_norm_mean"][ppo_epoch_idx] += accelerator.gather(grad_norms).mean()
-                    metrics["grad_norm_max"][ppo_epoch_idx] += accelerator.gather(grad_norms).max()
-                    metrics["grad_norm_std"][ppo_epoch_idx] += accelerator.gather(grad_norms).std()
+                    metrics["loss"][ppo_epoch_idx] += loss.detach().mean()
+                    metrics["baseline"][ppo_epoch_idx] += mb_baseline.mean()
+                    metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
+                    metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
+                    metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
+                    metrics["penalty_frac"][ppo_epoch_idx] += penalty_frac.mean().item()
 
                     if args.train_dips:
-                        metrics["weighting"][ppo_epoch_idx] += accelerator.gather(weighting).mean()
-                        metrics["prob_ratio"][ppo_epoch_idx] += accelerator.gather(prob_ratio).mean()
-                        metrics["approx_kl"][ppo_epoch_idx] += accelerator.gather(approx_kl).mean()
+                        metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                        metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
+                        metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
                         if args.factor_loss:
                             # No need to log kl and policy grad norms - they're both the same as the loss.
                             # The distinction is in the gradient flow.
-                            metrics["policy_grad_norm_mean"][ppo_epoch_idx] += accelerator.gather(policy_term_grad_norms).mean()
-                            metrics["policy_grad_norm_max"][ppo_epoch_idx] += accelerator.gather(policy_term_grad_norms).max()
-                            metrics["policy_grad_norm_std"][ppo_epoch_idx] += accelerator.gather(policy_term_grad_norms).std()
-                            metrics["kl_grad_norm_mean"][ppo_epoch_idx] += accelerator.gather(kl_term_grad_norms).mean()
-                            metrics["kl_grad_norm_max"][ppo_epoch_idx] += accelerator.gather(kl_term_grad_norms).max()
-                            metrics["kl_grad_norm_std"][ppo_epoch_idx] += accelerator.gather(kl_term_grad_norms).std()
+                            metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
+                            metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
+                            metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
+                            metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
+                            metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
+                            metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
                     else:
-                        metrics["weighting"][ppo_epoch_idx] += accelerator.gather(weighting).mean()
-                        metrics["new_logprobs"][ppo_epoch_idx] += accelerator.gather(new_logprobs).mean()
-                        metrics["approx_kl"][ppo_epoch_idx] += accelerator.gather(approx_kl).mean()
-                        metrics["penalty_frac"][ppo_epoch_idx] += accelerator.gather(penalty_frac).item()
+                        metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                        metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
+                        metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
                         
         with torch.no_grad():
             mean_kl = kl.sum(1).mean()
@@ -827,7 +828,7 @@ if __name__ == "__main__":
             writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
 
             for stats in metrics:
-                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item(), update)
+                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
 
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
