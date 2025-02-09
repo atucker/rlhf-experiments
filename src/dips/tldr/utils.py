@@ -17,7 +17,7 @@ def set_seed(seed):
 #     grad_norms = torch.tensor(grad_norms, device = device)
 #     return grad_norms
 
-def get_grad_norms(loss, params: list, device = "cpu") -> torch.tensor:
+def get_grad_norms(loss, params: list, device = "cpu") -> torch.Tensor:
     grad = torch.autograd.grad(
         outputs = loss,
         inputs = params,

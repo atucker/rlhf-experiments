@@ -27,6 +27,8 @@ from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
+from jaxtyping import Float, Int, Bool, jaxtyped
+
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -237,11 +239,17 @@ def whiten(values, shift_mean=True):
         whitened += mean
     return whitened
 
-def filter_by_length(sample, tokenizer, max_length: int = 256):
+@jaxtyped
+def filter_by_length(sample: str, 
+                     tokenizer: AutoTokenizer, 
+                     max_length: int = 256,
+                     ) -> Bool[torch.Tensor, "batch_size"]:
     return len(tokenizer(sample["instruction"]).input_ids) <= max_length
 
+@jaxtyped
 def get_reward(reward_model: nn.Module, 
-               input_ids: torch.Tensor) -> torch.Tensor:
+               input_ids: Int[torch.Tensor, "batch_size seq_len"],
+               ) -> Float[torch.Tensor, "batch_size"]:
     """
     Uses the reward model to calculate reward information for the given query_responses.
 
@@ -667,7 +675,6 @@ if __name__ == "__main__":
     )
     # Note: Don't add eos_token_id to the above generation configs - we don't want to avoid generating the eos token.
 
-    accelerator.print("===training policy===")
     global_step = 0
     start_time = time.time()
 
@@ -679,7 +686,6 @@ if __name__ == "__main__":
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         with torch.no_grad():
-            print("sampling evaluation")
             eval_storage, eval_df = evaluate(
                 args = args,
                 reward_model = reward_model,
@@ -756,7 +762,6 @@ if __name__ == "__main__":
             ref_logprobs = []
             scores = []
             sequence_lengths = []
-            baselines = []
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
                 query_response = generate(
@@ -781,6 +786,9 @@ if __name__ == "__main__":
 
                 debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
+                if accelerator.is_main_process and accelerator.is_local_main_process:
+                    wandb.log({"model/output_dtype": str(output.logits.dtype)}, step=0) 
+
                 logits = output.logits[:, context_length - 1 : -1]
                 # Pad output sequence to response_length (necessary to avoid shape mismatch across devices)
                 # pad = torch.zeros(logits.shape[0], args.task.response_length-logits.shape[1], dtype = logits.dtype).to(device)
@@ -815,20 +823,6 @@ if __name__ == "__main__":
                 score = get_reward(reward_model = reward_model, 
                                 input_ids = truncated_query_response)
 
-                # Calculate baselines
-                if args.rloo_k > 1:
-                    # The shape of score is [batch_size * rloo_k]
-                    per_prompt_scores = score.reshape(-1, args.rloo_k)
-                    per_prompt_logprobs = torch.sum(logprob, axis = 1).reshape(-1, args.rloo_k)
-                    per_prompt_ref_logprobs = torch.sum(ref_logprob, axis = 1).reshape(-1, args.rloo_k)
-                    per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
-                    kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
-                    score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
-                    baseline = score_baseline - kl_ctl.value * kl_baseline
-                    baseline = baseline.reshape(-1)
-                else:
-                    baseline = torch.zeros_like(score)
-
                 query_responses.append(query_response)
                 responses.append(response)
                 postprocessed_responses.append(postprocessed_response)
@@ -836,7 +830,6 @@ if __name__ == "__main__":
                 ref_logprobs.append(ref_logprob)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
-                baselines.append(baseline)
 
             query_responses = torch.cat(query_responses, 0)
             responses = torch.cat(responses, 0)
@@ -845,19 +838,33 @@ if __name__ == "__main__":
             ref_logprobs = torch.cat(ref_logprobs, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
-            baselines = torch.cat(baselines, 0)
-            del (logprob, ref_logprob, score, baseline)
+            del (logprob, ref_logprob, score)
             torch.cuda.empty_cache()
 
             # scale RM scores
             scores = scores * args.task.reward_coef
+            assert scores.shape == torch.Size([query.shape[0] * args.rloo_k]), f"scores.shape {scores.shape} does not match query_responses.shape {query_responses.shape} * args.rloo_k {args.rloo_k}"
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id (doesn't exceed max len)
             # responses not passing that filter will receive a low (fixed) score
             # only query RM on responses that pass that filter
             contain_eos_token = torch.any(responses == tokenizer.eos_token_id, dim=-1)
             scores = torch.where(contain_eos_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
-            accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
+            penalty_frac = 1 - (contain_eos_token.sum() / len(contain_eos_token))
+
+            # Calculate baselines
+            if args.rloo_k > 1:
+                # The shape of score is [batch_size * rloo_k]
+                per_prompt_scores = scores.reshape(-1, args.rloo_k)
+                per_prompt_logprobs = torch.sum(logprobs, axis = 1).reshape(-1, args.rloo_k)
+                per_prompt_ref_logprobs = torch.sum(ref_logprobs, axis = 1).reshape(-1, args.rloo_k)
+                per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
+                kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
+                score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
+                baselines = score_baseline - kl_ctl.value * kl_baseline
+                baselines = baselines.reshape(-1)
+            else:
+                baselines = torch.zeros_like(scores)
 
             # 4. compute rewards
             kl = logprobs - ref_logprobs # [batch_size, response_len]
@@ -879,6 +886,8 @@ if __name__ == "__main__":
         stats_shape = (args.ppo.noptepochs)
         metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
         num_samples = len(query_responses)
+        num_minibatches = num_samples // args.per_device_train_batch_size
+
         if args.use_chat_template:
             context_length = args.task.query_length + args.task.chat_template_buffer_length
         else:
@@ -959,34 +968,33 @@ if __name__ == "__main__":
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    with torch.no_grad():
-                        # Do whatever logging we want
-                        metrics["loss"][ppo_epoch_idx] += loss.detach()
-                        metrics["baseline"][ppo_epoch_idx] += mb_baseline.mean()
-                        metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
-                        metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
-                        metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
+                with torch.no_grad():
+                    # Do whatever logging we want
+                    metrics["loss"][ppo_epoch_idx] += loss.detach().mean()
+                    metrics["baseline"][ppo_epoch_idx] += mb_baseline.mean()
+                    metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
+                    metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
+                    metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
+                    metrics["penalty_frac"][ppo_epoch_idx] += penalty_frac.mean().item()
 
-                        if args.train_dips:
-                            metrics["weighting"][ppo_epoch_idx] += weighting.mean()
-                            metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
-                            metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
-                            if args.factor_loss:
-                                # No need to log kl and policy grad norms - they're both the same as the loss.
-                                # The distinction is in the gradient flow.
-                                metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
-                                metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
-                                metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
-                                metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
-                                metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
-                                metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
-                        else:
-                            metrics["weighting"][ppo_epoch_idx] += weighting.mean()
-                            metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
-                            metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+                    if args.train_dips:
+                        metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                        metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
+                        metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+                        if args.factor_loss:
+                            # No need to log kl and policy grad norms - they're both the same as the loss.
+                            # The distinction is in the gradient flow.
+                            metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
+                            metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
+                            metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
+                            metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
+                            metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
+                            metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
+                    else:
+                        metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                        metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
+                        metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
 
-                        for key in metrics:
-                            metrics[key] /= args.gradient_accumulation_steps
                     
         with torch.no_grad():
             mean_kl = kl.sum(1).mean()
@@ -1008,7 +1016,7 @@ if __name__ == "__main__":
             writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
 
             for stats in metrics:
-                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item(), update)
+                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
 
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
