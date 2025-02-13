@@ -105,9 +105,8 @@ class Args:
     calculate_kl_on_truncated_responses: bool = True # recommended: False. See discussion in #rlhf.
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
-    kl_grad_patch: bool = False
+    kl_grad_patch: bool = False # use RLOO with the KL gradient term patched in. Should be theoretically equivalent to DIPS.
     swap_eos_token: bool = False # necessary if training the base model
-
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
     """the name of this experiment"""
@@ -178,6 +177,8 @@ class Args:
     """the name of the pretrained model to use"""
     sft_model_path: str = "meta-llama/Llama-3.1-8B"
     """the name of the pretrained model to use"""
+    chat_template_tokenizer: Optional[str] = "meta-llama/Llama-3.1-8B-Instruct"
+    """the name of the tokenizer to use for apply_chat_template"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
@@ -367,12 +368,11 @@ def force_clear_grads(accelerator, model, optimizer):
 
 def maybe_use_chat_template(instruction: List[str], 
                             use_chat_template: bool, 
-                            tokenizer: AutoTokenizer,
                             ) -> torch.Tensor:
     if use_chat_template:
         messages = [[{"role": "user", "content": instruction}] for instruction in instruction]
         # ^ necessary to use apply_chat_template
-        queries = tokenizer.apply_chat_template(messages, 
+        queries = chat_template_tokenizer.apply_chat_template(messages, 
                                                 padding = "max_length",
                                                 return_tensors="pt",
                                                 add_generation_prompt = True,
@@ -381,7 +381,7 @@ def maybe_use_chat_template(instruction: List[str],
         )
         return queries.to(device)
     else:
-        return tokenizer(instruction, 
+        return chat_template_tokenizer(instruction, 
                          padding="max_length", 
                          max_length=args.task.query_length,
                          truncation=True,
@@ -454,7 +454,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             instruction = data["instruction"]
             queries = maybe_use_chat_template(instruction, 
                                               use_chat_template = args.use_chat_template, 
-                                              tokenizer = tokenizer)
+                                              )
             context_length = queries.shape[1]
             if args.use_chat_template:
                 assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
@@ -550,13 +550,13 @@ if __name__ == "__main__":
         padding_side="left",
         trust_remote_code=True,
     )
-
-    rm_tokenizer = AutoTokenizer.from_pretrained(
-        args.reward_model_path,
-        use_fast = True,
-        trust_remote_code = True,
-        padding_side="left"
-    )
+    if args.chat_template_tokenizer is not None:
+        chat_template_tokenizer = AutoTokenizer.from_pretrained(
+            args.chat_template_tokenizer,
+            use_fast = True,
+            trust_remote_code = True,
+            padding_side="left"
+        )
     # we use the padding token manually but do not resize the token embedding of the model
     if args.task.truncate_token == "eos":
         args.task.truncate_token_id = tokenizer.eos_token_id
@@ -774,7 +774,7 @@ if __name__ == "__main__":
             instructions = data["instruction"]
             queries = maybe_use_chat_template(instructions,
                                             use_chat_template = args.use_chat_template,
-                                            tokenizer = tokenizer)
+                                            )
             query_responses = []
             responses = []
             postprocessed_responses = []
