@@ -106,6 +106,7 @@ class Args:
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
     kl_grad_patch: bool = False
+    swap_eos_token: bool = False # necessary if training the base model
 
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
@@ -169,13 +170,13 @@ class Args:
     """The number of processes (GPUs) to use"""
 
     # other args
-    base_model: str = "meta-llama/Llama-3.1-8B-Instruct"
+    base_model: str = "meta-llama/Llama-3.1-8B"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = "RLHFlow/ArmoRM-Llama3-8B-v0.1"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "meta-llama/Llama-3.1-8B-Instruct"
+    sft_model_path: str = "meta-llama/Llama-3.1-8B"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
@@ -274,6 +275,12 @@ class PrecisionModel(AutoModelForCausalLM):
             before_unembed = before_unembed.to(torch.float32)
             logits = self.lm_head(before_unembed)
         return logits
+    
+def swap_eos_token(output: torch.Tensor, tokenizer: AutoTokenizer, from_token: str = "<|eot_id|>", 
+                   to_token: str = "<|end_of_text|>") -> torch.Tensor:
+    from_token_id = tokenizer.convert_tokens_to_ids(from_token)
+    to_token_id = tokenizer.convert_tokens_to_ids(to_token)
+    return torch.where(output.sequences == from_token_id, to_token_id, output.sequences)
 
 def generate(lm_backbone: AutoModelForCausalLM, 
              queries: torch.Tensor, 
@@ -307,6 +314,10 @@ def generate(lm_backbone: AutoModelForCausalLM,
         # output_scores = True,
     )
     expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
+    if args.swap_eos_token:
+        output.sequences = swap_eos_token(output.sequences, tokenizer,
+                                          from_token = "<|end_of_text|>",
+                                          to_token = "<|eot_id|>")
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
     return full_sequences
 
@@ -354,7 +365,10 @@ def force_clear_grads(accelerator, model, optimizer):
     optimizer.zero_grad()
     torch.cuda.empty_cache()
 
-def maybe_use_chat_template(instruction: List[str], use_chat_template: bool, tokenizer: AutoTokenizer) -> torch.Tensor:
+def maybe_use_chat_template(instruction: List[str], 
+                            use_chat_template: bool, 
+                            tokenizer: AutoTokenizer,
+                            ) -> torch.Tensor:
     if use_chat_template:
         messages = [[{"role": "user", "content": instruction}] for instruction in instruction]
         # ^ necessary to use apply_chat_template
@@ -384,6 +398,10 @@ def forward(model: AutoModelForCausalLM,
     """
     attention_mask = responses != tokenizer.pad_token_id
     input_ids = torch.masked_fill(responses, ~attention_mask, 0)
+    if args.swap_eos_token:
+        input_ids = swap_eos_token(input_ids, tokenizer,
+                                    from_token = "<|eot_id|>",
+                                    to_token = "<|end_of_text|>")
     if ref:
         with model.disable_adapter():
             return model(
@@ -507,8 +525,10 @@ if __name__ == "__main__":
     if ("instruct" in args.base_model.lower()) and (not args.use_chat_template):
         warnings.warn("You are using an instruct model without chat template. This may lead to unexpected results.")
     
-    if ("instruct" not in args.base_model.lower()) and (args.use_chat_template):
-        warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results; the tokenization scheme between the instruct model and the base model may be different.")
+    if ("instruct" not in args.base_model.lower()):
+        assert args.swap_eos_token, "Make sure to swap the eos token when using a non-instruct model!"
+        if args.use_chat_template:
+            warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results; the tokenization scheme between the instruct model and the base model may be different.")
 
     if args.kl_grad_patch:
         assert not args.train_dips, "KL grad patch is only supported for RLOO training"
