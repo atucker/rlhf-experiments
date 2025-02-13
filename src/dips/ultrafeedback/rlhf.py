@@ -584,7 +584,7 @@ if __name__ == "__main__":
                 config=asdict(args),
                 name=run_name,
                 save_code=True,
-                mode="disabled" if args.disable_wandb else None,
+                mode="disabled" if args.track else None,
             )
             file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
             wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
