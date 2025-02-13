@@ -96,7 +96,6 @@ class TaskHParams:
 @dataclass
 class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
-    disable_wandb: bool = False
     factor_loss: bool = False
     debug_tensor_info: bool = False
     loss_full_precision: bool = False
@@ -106,7 +105,7 @@ class Args:
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
     kl_grad_patch: bool = False # use RLOO with the KL gradient term patched in. Should be theoretically equivalent to DIPS.
-    swap_eos_token: bool = False # necessary if training the base model
+    swap_eos_token: bool = True # necessary if training the base model
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
     """the name of this experiment"""
@@ -277,11 +276,11 @@ class PrecisionModel(AutoModelForCausalLM):
             logits = self.lm_head(before_unembed)
         return logits
     
-def swap_eos_token(output: torch.Tensor, tokenizer: AutoTokenizer, from_token: str = "<|eot_id|>", 
+def swap_eos_token(sequences: torch.Tensor, from_token: str = "<|eot_id|>", 
                    to_token: str = "<|end_of_text|>") -> torch.Tensor:
-    from_token_id = tokenizer.convert_tokens_to_ids(from_token)
-    to_token_id = tokenizer.convert_tokens_to_ids(to_token)
-    return torch.where(output.sequences == from_token_id, to_token_id, output.sequences)
+    from_token_id = chat_template_tokenizer.convert_tokens_to_ids(from_token)
+    to_token_id = chat_template_tokenizer.convert_tokens_to_ids(to_token)
+    return torch.where(sequences == from_token_id, to_token_id, sequences)
 
 def generate(lm_backbone: AutoModelForCausalLM, 
              queries: torch.Tensor, 
@@ -316,7 +315,7 @@ def generate(lm_backbone: AutoModelForCausalLM,
     )
     expanded_queries = queries.repeat_interleave(n_outputs_per_prompt, dim=0) # [batch_size * n_outputs_per_prompt, seq_len]
     if args.swap_eos_token:
-        output.sequences = swap_eos_token(output.sequences, tokenizer,
+        output.sequences = swap_eos_token(output.sequences,
                                           from_token = "<|end_of_text|>",
                                           to_token = "<|eot_id|>")
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
@@ -399,7 +398,7 @@ def forward(model: AutoModelForCausalLM,
     attention_mask = responses != tokenizer.pad_token_id
     input_ids = torch.masked_fill(responses, ~attention_mask, 0)
     if args.swap_eos_token:
-        input_ids = swap_eos_token(input_ids, tokenizer,
+        input_ids = swap_eos_token(input_ids,
                                     from_token = "<|eot_id|>",
                                     to_token = "<|end_of_text|>")
     if ref:
@@ -550,6 +549,8 @@ if __name__ == "__main__":
         padding_side="left",
         trust_remote_code=True,
     )
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
     if args.chat_template_tokenizer is not None:
         chat_template_tokenizer = AutoTokenizer.from_pretrained(
             args.chat_template_tokenizer,
@@ -557,10 +558,10 @@ if __name__ == "__main__":
             trust_remote_code = True,
             padding_side="left"
         )
+        chat_template_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     # we use the padding token manually but do not resize the token embedding of the model
     if args.task.truncate_token == "eos":
         args.task.truncate_token_id = tokenizer.eos_token_id
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     console = Console(force_terminal=True)
 
@@ -806,7 +807,7 @@ if __name__ == "__main__":
 
                 debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
-                if accelerator.is_main_process and accelerator.is_local_main_process:
+                if accelerator.is_main_process and accelerator.is_local_main_process and args.track:
                     wandb.log({"model/output_dtype": str(output.logits.dtype)}, step=0) 
 
                 logits = output.logits[:, context_length - 1 : -1]
