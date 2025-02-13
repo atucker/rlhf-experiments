@@ -38,6 +38,7 @@ from transformers import (
     GenerationConfig,
     PretrainedConfig,
     PreTrainedModel,
+    get_scheduler,
 )
 from peft import get_peft_model, LoraConfig
 import random
@@ -105,7 +106,7 @@ class Args:
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
     kl_grad_patch: bool = False # use RLOO with the KL gradient term patched in. Should be theoretically equivalent to DIPS.
-    swap_eos_token: bool = True # necessary if training the base model
+    swap_eos_token: bool = False # necessary if training the base model
     # common args
     exp_name: str = "llama_3_8b_ultrafeedback"
     """the name of this experiment"""
@@ -135,32 +136,32 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 5e-5
+    lr: float = 1e-5
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
     scheduler: str = "linear"
     """Which scheduler to use"""
-    warm_up_steps: int = 0
+    warm_up_steps: int = 50
     """Number of warm up steps for the scheduler"""
 
     # default args
     batch_size: int = -1
 
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 64
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 2 # number of samples to use for RLOO's baseline calculation
+    rloo_k: int = 4 # number of samples to use for RLOO's baseline calculation
     
     per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 4
+    local_rollout_forward_batch_size: int = 2
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
-    total_episodes: int = int(6416) # Informs the number of ppo updates to do
+    total_episodes: int = int(6416 * 4) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
@@ -168,15 +169,15 @@ class Args:
     """The number of processes (GPUs) to use"""
 
     # other args
-    base_model: str = "meta-llama/Llama-3.1-8B"
+    base_model: str = "meta-llama/Llama-3.1-8B-Instruct"
     """the name of the pretrained model to use"""
     offload: bool = False
     """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = "RLHFlow/ArmoRM-Llama3-8B-v0.1"
     """the name of the pretrained model to use"""
-    sft_model_path: str = "meta-llama/Llama-3.1-8B"
+    sft_model_path: str = "meta-llama/Llama-3.1-8B-Instruct"
     """the name of the pretrained model to use"""
-    chat_template_tokenizer: Optional[str] = "meta-llama/Llama-3.1-8B-Instruct"
+    chat_template_tokenizer: Optional[str] = None
     """the name of the tokenizer to use for apply_chat_template"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
@@ -184,9 +185,9 @@ class Args:
     """Which layers to apply dropout to"""
     output_dir: str = "models/llama_3_8b_armoRM_ultrafeedback"
     """Where to save the model"""
-    lora_rank: int = 64
+    lora_rank: int = 256
     """the rank of the lora matrix"""
-    lora_alpha: int = 64
+    lora_alpha: int = 256
     """weight of lora"""
     lora_dropout: float = 0.0
     """dropout for lora"""
@@ -511,7 +512,7 @@ if __name__ == "__main__":
     set_seed(local_seed)
 
     args.world_size = accelerator.num_processes
-    args.batch_size = args.per_device_train_batch_size * args.world_size * args.gradient_accumulation_steps
+    args.batch_size = args.per_device_train_batch_size * args.world_size
     # args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
     # if args.ppo.whiten_rewards:
     #     assert (
@@ -559,6 +560,9 @@ if __name__ == "__main__":
             padding_side="left"
         )
         chat_template_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    else:
+        chat_template_tokenizer = tokenizer
+        
     # we use the padding token manually but do not resize the token embedding of the model
     if args.task.truncate_token == "eos":
         args.task.truncate_token_id = tokenizer.eos_token_id
@@ -645,6 +649,13 @@ if __name__ == "__main__":
         optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
+
+    scheduler = get_scheduler(
+        args.scheduler,
+        optimizer = optimizer,
+        num_warmup_steps = args.warm_up_steps,
+        num_training_steps = args.ppo.num_updates,
+    )
 
     dataset = load_dataset(args.task.query_dataset, split="train")
     train_val_split = dataset.train_test_split(test_size=0.1, seed=args.seed) # use a consistent seed across runs
@@ -1029,36 +1040,41 @@ if __name__ == "__main__":
 
                     
         with torch.no_grad():
-            mean_kl = kl.sum(1).mean()
-            mean_entropy = (-logprobs).sum(1).mean()
-            mean_non_score_reward = non_score_reward.sum(1).mean()
+            if accelerator.is_main_process:
+                mean_kl = kl.sum(1).mean()
+                mean_entropy = (-logprobs).sum(1).mean()
+                mean_non_score_reward = non_score_reward.sum(1).mean()
 
-            writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
-            writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
-            writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
-            writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
-            writer.add_scalar(
-                "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
-            )
-            writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
-            writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
+                writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
+                writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
+                writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
+                writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
+                writer.add_scalar(
+                    "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
+                )
+                writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
+                writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
 
-            writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
-            writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
-            writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
+                writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
+                writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
+                writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
 
-            for stats in metrics:
-                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
+                for stats in metrics:
+                    writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
 
-            if args.reward.use_adaptive_kl:
-                kl_ctl.update(mean_kl.item(), args.batch_size)
-            
-            del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
-            del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
-            torch.cuda.empty_cache()
-            if args.force_clear_grad_optim:
-                if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
-                    force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
+                scheduler.step()
+                writer.add_scalar("train/lr", scheduler.get_last_lr()[0], update)
+
+                if args.reward.use_adaptive_kl:
+                    kl_ctl.update(mean_kl.item(), args.batch_size)
+                
+                del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
+                del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
+
+                torch.cuda.empty_cache()
+                if args.force_clear_grad_optim:
+                    if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
+                        force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
 
     if args.run_eval:
         eval_storage, eval_df = evaluate(
