@@ -802,8 +802,12 @@ if __name__ == "__main__":
                 response = query_response[:, context_length:]
 
                 # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
-                postprocessed_response = truncate_response(args, tokenizer, response)
-                logprob_mask = postprocessed_response == tokenizer.pad_token_id
+                if args.swap_eos_token:
+                    postprocessed_response = truncate_response(args, chat_template_tokenizer, response)
+                    logprob_mask = postprocessed_response == chat_template_tokenizer.eos_token_id
+                else:
+                    postprocessed_response = truncate_response(args, tokenizer, response)
+                    logprob_mask = postprocessed_response == tokenizer.pad_token_id
                 sequence_length = first_true_indices(logprob_mask) - 1
 
                 debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
@@ -870,7 +874,10 @@ if __name__ == "__main__":
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id (doesn't exceed max len)
             # responses not passing that filter will receive a low (fixed) score
             # only query RM on responses that pass that filter
-            contain_eos_token = torch.any(responses == tokenizer.eos_token_id, dim=-1)
+            if args.swap_eos_token:
+                contain_eos_token = torch.any(responses == chat_template_tokenizer.eos_token_id, dim=-1)
+            else:
+                contain_eos_token = torch.any(responses == tokenizer.eos_token_id, dim=-1)
             scores = torch.where(contain_eos_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
             penalty_frac = 1 - (contain_eos_token.sum() / len(contain_eos_token))
 
@@ -942,7 +949,10 @@ if __name__ == "__main__":
                     new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                     # shape [batch_size] (total logprob of the response)
                     if args.calculate_kl_on_truncated_responses:
-                        logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
+                        if args.swap_eos_token:
+                            logprob_mask = mb_postprocessed_responses == chat_template_tokenizer.eos_token_id
+                        else:
+                            logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
                         new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
                     new_logprobs = torch.sum(new_logprobs, axis=1)
                     with torch.amp.autocast(device_type = "cuda",
