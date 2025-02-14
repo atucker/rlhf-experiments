@@ -136,7 +136,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 1e-5
+    lr: float = 3e-6
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
@@ -158,10 +158,10 @@ class Args:
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 2
+    local_rollout_forward_batch_size: int = 4
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
-    total_episodes: int = int(6416 * 4) # Informs the number of ppo updates to do
+    total_episodes: int = int(6416) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
@@ -1040,41 +1040,40 @@ if __name__ == "__main__":
 
                     
         with torch.no_grad():
-            if accelerator.is_main_process:
-                mean_kl = kl.sum(1).mean()
-                mean_entropy = (-logprobs).sum(1).mean()
-                mean_non_score_reward = non_score_reward.sum(1).mean()
+            mean_kl = kl.sum(1).mean()
+            mean_entropy = (-logprobs).sum(1).mean()
+            mean_non_score_reward = non_score_reward.sum(1).mean()
 
-                writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
-                writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
-                writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
-                writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
-                writer.add_scalar(
-                    "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
-                )
-                writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
-                writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
+            writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
+            writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
+            writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
+            writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
+            writer.add_scalar(
+                "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
+            )
+            writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
+            writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
 
-                writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
-                writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
-                writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
+            writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
+            writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
+            writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
 
-                for stats in metrics:
-                    writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
+            for stats in metrics:
+                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
 
-                scheduler.step()
-                writer.add_scalar("train/lr", scheduler.get_last_lr()[0], update)
+            scheduler.step()
+            writer.add_scalar("train/lr", scheduler.get_last_lr()[0], update)
 
-                if args.reward.use_adaptive_kl:
-                    kl_ctl.update(mean_kl.item(), args.batch_size)
-                
-                del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
-                del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
+            if args.reward.use_adaptive_kl:
+                kl_ctl.update(mean_kl.item(), args.batch_size)
+            
+            del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
+            del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
-                torch.cuda.empty_cache()
-                if args.force_clear_grad_optim:
-                    if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
-                        force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
+            torch.cuda.empty_cache()
+            if args.force_clear_grad_optim:
+                if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
+                    force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
 
     if args.run_eval:
         eval_storage, eval_df = evaluate(
