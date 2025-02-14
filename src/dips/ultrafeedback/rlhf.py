@@ -136,7 +136,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 3e-6
+    lr: float = 1e-4
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
