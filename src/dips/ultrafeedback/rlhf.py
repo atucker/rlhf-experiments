@@ -126,7 +126,7 @@ class Args:
     "the user or org name of the model repository from the Hugging Face Hub"
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 1000
+    print_sample_output_freq: int = 200
     """How often to print sample output"""
     run_eval: bool = True
     """Whether to run evaluation"""
@@ -156,7 +156,7 @@ class Args:
     
     per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 8
+    per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
     local_rollout_forward_batch_size: int = 4
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
