@@ -5,7 +5,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union, Dict
 from collections import defaultdict
 
 import numpy as np
@@ -260,6 +260,8 @@ def get_reward(reward_model: nn.Module,
     """
     with torch.no_grad():
         scores = []
+        reward_breakdown = []
+        reward_breakdown_coeffs = []
         for elem in input_ids:
             no_pad_input_ids = torch.masked_select(elem, elem != tokenizer.pad_token_id).unsqueeze(0)
             attention_mask = no_pad_input_ids != tokenizer.pad_token_id
@@ -267,7 +269,9 @@ def get_reward(reward_model: nn.Module,
                                 attention_mask=attention_mask,
                                 return_dict=True)
             scores.append(output.score)
-    return torch.cat(scores)
+            reward_breakdown.append(output.rewards)
+            reward_breakdown_coeffs.append(output.gating_output @ reward_model.reward_transform_matrix.data.T)
+        return torch.cat(scores), torch.cat(reward_breakdown), torch.cat(reward_breakdown_coeffs)
 
 class PrecisionModel(AutoModelForCausalLM):
     def forward(self, *args, **kwargs):
@@ -282,6 +286,20 @@ def swap_eos_token(sequences: torch.Tensor, from_token: str = "<|eot_id|>",
     from_token_id = chat_template_tokenizer.convert_tokens_to_ids(from_token)
     to_token_id = chat_template_tokenizer.convert_tokens_to_ids(to_token)
     return torch.where(sequences == from_token_id, to_token_id, sequences)
+
+def parse_reward_breakdown_attributes(reward_breakdown: torch.Tensor, reward_breakdown_coeffs: torch.Tensor) -> Tuple[Dict[str, float], Dict[str, float]]:
+    attributes = ['helpsteer-helpfulness','helpsteer-correctness','helpsteer-coherence',
+   'helpsteer-complexity','helpsteer-verbosity','ultrafeedback-overall_score',
+   'ultrafeedback-instruction_following', 'ultrafeedback-truthfulness',
+   'ultrafeedback-honesty','ultrafeedback-helpfulness','beavertails-is_safe',
+   'prometheus-score','argilla-overall_quality','argilla-judge_lm','code-complexity',
+   'code-style','code-explanation','code-instruction-following','code-readability']
+    reward_breakdown_dict = {}
+    reward_breakdown_coeffs_dict = {}
+    for index, elem in enumerate(attributes):
+        reward_breakdown_dict[elem] = reward_breakdown[:, index].mean().item()
+        reward_breakdown_coeffs_dict[elem] = reward_breakdown_coeffs[:, index].mean().item()
+    return reward_breakdown_dict, reward_breakdown_coeffs_dict
 
 def generate(lm_backbone: AutoModelForCausalLM, 
              queries: torch.Tensor, 
@@ -476,11 +494,11 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             # expanded_queries = queries.repeat_interleave(rloo_k, dim=0)
             # postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             truncated_query_responses = torch.cat([queries, postprocessed_responses], dim = 1)
-            score = get_reward(reward_model = reward_model, 
+            scores, _, _ = get_reward(reward_model = reward_model, 
                                input_ids = truncated_query_responses)
             eval_storage.query_token.extend(queries)
             eval_storage.postprocessed_response_token.extend(postprocessed_responses)
-            eval_storage.score.append(score)
+            eval_storage.score.append(scores)
 
             if sampling:
                 break
@@ -794,6 +812,8 @@ if __name__ == "__main__":
             logprobs = []
             ref_logprobs = []
             scores = []
+            reward_breakdowns = []
+            reward_breakdowns_coeffs = []
             sequence_lengths = []
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
@@ -857,7 +877,7 @@ if __name__ == "__main__":
                 # for inst in instruction_batch:
                 #     repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
                 truncated_query_response = torch.cat([query_response[:, :context_length], postprocessed_response], dim = 1)
-                score = get_reward(reward_model = reward_model, 
+                score, reward_breakdown, reward_breakdown_coeffs = get_reward(reward_model = reward_model, 
                                 input_ids = truncated_query_response)
 
                 query_responses.append(query_response)
@@ -867,6 +887,8 @@ if __name__ == "__main__":
                 ref_logprobs.append(ref_logprob)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
+                reward_breakdowns.append(reward_breakdown)
+                reward_breakdowns_coeffs.append(reward_breakdown_coeffs)
 
             query_responses = torch.cat(query_responses, 0)
             responses = torch.cat(responses, 0)
@@ -875,6 +897,8 @@ if __name__ == "__main__":
             ref_logprobs = torch.cat(ref_logprobs, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
+            reward_breakdowns = torch.cat(reward_breakdowns, 0)
+            reward_breakdowns_coeffs = torch.cat(reward_breakdowns_coeffs, 0)
             del (logprob, ref_logprob, score)
             torch.cuda.empty_cache()
 
@@ -917,6 +941,15 @@ if __name__ == "__main__":
             writer.add_scalar("generation/seq_len_std", sequence_lengths.to(torch.float32).std().item(), update)
             writer.add_scalar("generation/seq_len_max", sequence_lengths.max().item(), update)
             writer.add_scalar("generation/seq_len_min", sequence_lengths.min().item(), update)
+
+            # Log reward breakdowns to wandb
+            reward_breakdown_dict, reward_breakdown_coeffs_dict = parse_reward_breakdown_attributes(reward_breakdown = reward_breakdown, 
+                                                                                reward_breakdown_coeffs = reward_breakdown_coeffs)
+            if args.track:
+                for key in reward_breakdown_dict:
+                    wandb.log({f"reward_breakdown/{key}": reward_breakdown_dict[key]}, step = update)
+                    wandb.log({f"reward_breakdown_coeffs/{key}": reward_breakdown_coeffs_dict[key]}, step = update)
+            del reward_breakdown, reward_breakdown_coeffs, reward_breakdown_dict, reward_breakdown_coeffs_dict
 
             torch.cuda.empty_cache()
 
