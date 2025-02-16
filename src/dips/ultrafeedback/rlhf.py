@@ -844,7 +844,7 @@ if __name__ == "__main__":
                 debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
                 if accelerator.is_main_process and accelerator.is_local_main_process and args.track:
-                    wandb.log({"model/output_dtype": str(output.logits.dtype)}, step=0) 
+                    wandb.config.update({"model/output_dtype": str(output.logits.dtype)})
 
                 logits = output.logits[:, context_length - 1 : -1]
                 # Pad output sequence to response_length (necessary to avoid shape mismatch across devices)
@@ -947,8 +947,8 @@ if __name__ == "__main__":
                                                                                 reward_breakdown_coeffs = reward_breakdown_coeffs)
             if args.track:
                 for key in reward_breakdown_dict:
-                    wandb.log({f"reward_breakdown/{key}": reward_breakdown_dict[key]}, step = update)
-                    wandb.log({f"reward_breakdown_coeffs/{key}": reward_breakdown_coeffs_dict[key]}, step = update)
+                    writer.add_scalar(f"reward_breakdown/{key}", reward_breakdown_dict[key], update)
+                    writer.add_scalar(f"reward_breakdown_coeffs/{key}", reward_breakdown_coeffs_dict[key], update)
             del reward_breakdown, reward_breakdown_coeffs, reward_breakdown_dict, reward_breakdown_coeffs_dict
 
             torch.cuda.empty_cache()
