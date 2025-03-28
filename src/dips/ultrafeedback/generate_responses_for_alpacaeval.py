@@ -1,20 +1,41 @@
 from vllm import LLM, SamplingParams
-llm = LLM(model="merged_model", task="generate", max_model_len = 1024 + 64 + 1, tensor_parallel_size = 4)
-
 from datasets import load_dataset
-ds = load_dataset("openbmb/UltraFeedback")
-
 from transformers import AutoTokenizer
+from tqdm import tqdm, trange
+import json
+
+query_length = 256
+response_length = 1024
+template_length = 64
+llm = LLM(model="merged_model", 
+          task="generate", 
+          max_model_len = query_length + response_length + template_length + 1, 
+          tensor_parallel_size = 4, 
+          gpu_memory_utilization = 0.8)
+
+ds = load_dataset("openbmb/UltraFeedback")
 
 ultrafeedback_instructions = ds["train"]["instruction"]
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
 tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-prompt_token_ids = [tokenizer.apply_chat_template([{"role": "user", "content": instruction}],
+tokenizer.padding_side = "left"
+pairs = [(tokenizer.apply_chat_template([{"role": "user", "content": instruction}],
                                                  add_generation_prompt=True,
                                                   padding = "max_length",
-                                                  max_length = 1024 + 64,
-                                                  truncation = True) for instruction in ultrafeedback_instructions]
+                                                  max_length = query_length + template_length,
+                                                  truncation = True), instruction) for instruction in tqdm(ultrafeedback_instructions)
+                                                  if len(tokenizer(instruction).input_ids) <= query_length]
 
-sampling_params = SamplingParams(temperature=0.7, top_p=0.95)
+prompt_token_ids, instructions = zip(*pairs)
+print(f"Sampling {len(prompt_token_ids)} instructions.")
 
+sampling_params = SamplingParams(temperature=0.7, top_p=0.95, max_tokens = response_length)
 outputs = llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+
+alpaca_eval_outputs = []
+for index in range(len(outputs)):
+    output = {"instruction": instructions[index], "output": outputs[index].outputs[0].text}
+    alpaca_eval_outputs.append(output)
+
+with open("alpaca_eval_outputs.json", "w") as f:
+    json.dump(alpaca_eval_outputs, f)
