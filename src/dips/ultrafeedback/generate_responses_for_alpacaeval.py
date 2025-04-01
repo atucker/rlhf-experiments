@@ -3,11 +3,16 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm, trange
 import json
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, required=True)
+args = parser.parse_args()
 
 query_length = 256
 response_length = 1024
 template_length = 64
-llm = LLM(model="merged_model", 
+llm = LLM(model=args.model, 
           task="generate", 
           max_model_len = query_length + response_length + template_length + 1, 
           tensor_parallel_size = 4, 
@@ -27,6 +32,7 @@ pairs = [(tokenizer.apply_chat_template([{"role": "user", "content": instruction
                                                   if len(tokenizer(instruction).input_ids) <= query_length]
 
 prompt_token_ids, instructions = zip(*pairs)
+prompt_token_ids = list(prompt_token_ids)
 print(f"Sampling {len(prompt_token_ids)} instructions.")
 
 sampling_params = SamplingParams(temperature=0.7, top_p=0.95, max_tokens = response_length)
