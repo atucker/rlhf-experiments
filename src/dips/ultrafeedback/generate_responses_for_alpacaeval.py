@@ -45,7 +45,7 @@ for i in trange(0, len(prompt_token_ids), CHECKPOINT_FREQ):
 
     for index in range(len(outputs)):
         output = {"instruction": instructions[index], "output": outputs[index].outputs[0].text}
-    alpaca_eval_outputs.append(output)
+        alpaca_eval_outputs.append(output)
 
     with open(f"{args.model}_alpaca_eval_outputs_{i}.json", "w") as f:
         json.dump(alpaca_eval_outputs, f)
