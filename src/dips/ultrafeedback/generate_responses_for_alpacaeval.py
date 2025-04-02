@@ -37,7 +37,7 @@ print(f"Sampling {len(prompt_token_ids)} instructions.")
 
 sampling_params = SamplingParams(temperature=0.7, top_p=0.95, max_tokens = response_length)
 
-CHECKPOINT_FREQ = 2000
+CHECKPOINT_FREQ = 5000
 alpaca_eval_outputs = []
 
 for i in trange(0, len(prompt_token_ids), CHECKPOINT_FREQ):
