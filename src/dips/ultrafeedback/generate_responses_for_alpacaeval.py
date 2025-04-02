@@ -15,7 +15,7 @@ template_length = 64
 llm = LLM(model=args.model, 
           task="generate", 
           max_model_len = query_length + response_length + template_length + 1, 
-          tensor_parallel_size = 4, 
+          tensor_parallel_size = 2, 
           gpu_memory_utilization = 0.8)
 
 ds = load_dataset("openbmb/UltraFeedback")
@@ -36,12 +36,19 @@ prompt_token_ids = list(prompt_token_ids)
 print(f"Sampling {len(prompt_token_ids)} instructions.")
 
 sampling_params = SamplingParams(temperature=0.7, top_p=0.95, max_tokens = response_length)
-outputs = llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
 
+CHECKPOINT_FREQ = 2000
 alpaca_eval_outputs = []
-for index in range(len(outputs)):
-    output = {"instruction": instructions[index], "output": outputs[index].outputs[0].text}
+
+for i in trange(0, len(prompt_token_ids), CHECKPOINT_FREQ):
+    outputs = llm.generate(prompt_token_ids=prompt_token_ids[i:min(i+CHECKPOINT_FREQ, len(prompt_token_ids))], sampling_params=sampling_params)
+
+    for index in range(len(outputs)):
+        output = {"instruction": instructions[index], "output": outputs[index].outputs[0].text}
     alpaca_eval_outputs.append(output)
 
-with open("alpaca_eval_outputs.json", "w") as f:
+    with open(f"{args.model}_alpaca_eval_outputs_{i}.json", "w") as f:
+        json.dump(alpaca_eval_outputs, f)
+
+with open(f"{args.model}_alpaca_eval_outputs_final.json", "w") as f:
     json.dump(alpaca_eval_outputs, f)
