@@ -26,7 +26,7 @@ tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 tokenizer.padding_side = "left"
 pairs = [(tokenizer.apply_chat_template([{"role": "user", "content": instruction}],
                                                  add_generation_prompt=True,
-                                                  padding = "max_length",
+                                                  padding = False,
                                                   max_length = query_length + template_length,
                                                   truncation = True), instruction) for instruction in tqdm(ultrafeedback_instructions)
                                                   if len(tokenizer(instruction).input_ids) <= query_length]
@@ -41,7 +41,8 @@ CHECKPOINT_FREQ = 5000
 alpaca_eval_outputs = []
 
 for i in trange(0, len(prompt_token_ids), CHECKPOINT_FREQ):
-    outputs = llm.generate(prompt_token_ids=prompt_token_ids[i:min(i+CHECKPOINT_FREQ, len(prompt_token_ids))], sampling_params=sampling_params)
+    outputs = llm.generate(prompt_token_ids=prompt_token_ids[i:min(i+CHECKPOINT_FREQ, len(prompt_token_ids))], 
+                           sampling_params=sampling_params)
 
     for index in range(len(outputs)):
         output = {"instruction": instructions[index], "output": outputs[index].outputs[0].text}
