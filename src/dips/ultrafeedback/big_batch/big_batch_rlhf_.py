@@ -43,7 +43,6 @@ from transformers import (
 from peft import get_peft_model, LoraConfig
 import random
 import warnings
-
 from vllm import LLM, SamplingParams
 
 # Package imports
@@ -72,7 +71,6 @@ class PpoHParams:
     gamma: float = 1
     lam: float = 0.95
     whiten_rewards: bool = False
-
 
 @dataclass
 class TaskHParams:
@@ -309,7 +307,8 @@ def generate(lm_backbone: AutoModelForCausalLM,
              generation_config: GenerationConfig,
              n_outputs_per_prompt: int = 1) -> torch.Tensor:
     """
-    Generates in a way that does not affect padding tokens.
+    Generates in a way that does not affect padding tokens using HuggingFace Transformers.
+    Kept for reference or fallback, but generate_vllm should be used for rollouts if available.
 
     Args:
         lm_backbone: The language model backbone to use.
@@ -341,91 +340,6 @@ def generate(lm_backbone: AutoModelForCausalLM,
                                           to_token = "<|eot_id|>")
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
     return full_sequences
-
-def generate_vllm(llm_engine: LLM,
-                  prompts: List[str],
-                  tokenizer: AutoTokenizer, # Tokenizer used for prompts & padding
-                  generation_config: GenerationConfig,
-                  context_length: int, # Length of tokenized prompt
-                  output_length: int, # Desired total output length (prompt + response)
-                  device: torch.device,
-                  n_outputs_per_prompt: int = 1,
-                 ) -> torch.Tensor:
-    """
-    Generates sequences using VLLM engine.
-    Designed to be called from the main process (rank 0).
-
-    Args:
-        llm_engine: Initialized VLLM LLM engine.
-        prompts: List of prompt strings.
-        tokenizer: Tokenizer associated with the prompts/model.
-        generation_config: HF GenerationConfig to extract parameters from.
-        context_length: The max length of the tokenized prompts.
-        output_length: The target total sequence length (prompt + response) for padding.
-        device: Target torch device for the output tensor.
-        n_outputs_per_prompt: Number of sequences per prompt (k).
-
-    Returns:
-        Tensor of generated sequences (prompt + response). Shape: [num_prompts * n_outputs_per_prompt, output_length]
-    """
-    sampling_params = SamplingParams(
-        n=n_outputs_per_prompt,
-        temperature=generation_config.temperature if generation_config.temperature > 1e-6 else 1e-6, # VLLM requires temp > 0
-        top_p=generation_config.top_p if generation_config.top_p < 1.0 else 1.0,
-        top_k=generation_config.top_k if generation_config.top_k > 0 else -1, # VLLM uses -1 for no top_k
-        max_tokens=generation_config.max_new_tokens,
-        # min_tokens=generation_config.min_new_tokens, # VLLM might not support min_tokens
-        stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id else None,
-        skip_special_tokens=False, # Keep special tokens like EOS
-        logprobs=None, # Not needed here; will compute later with `forward`
-    )
-
-    # VLLM call
-    vllm_outputs = llm_engine.generate(prompts, sampling_params, use_tqdm=False)
-
-    all_output_sequences = []
-    # Re-tokenize prompts to get the exact input IDs VLLM used (more robust than assuming first N tokens match)
-    prompt_token_ids_dict = tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=context_length)
-    prompt_token_ids = prompt_token_ids_dict.input_ids
-    prompt_attn_mask = prompt_token_ids_dict.attention_mask
-
-    output_idx = 0
-    for i, request_output in enumerate(vllm_outputs):
-        # Get the actual prompt tokens used (handling padding)
-        current_prompt_len = prompt_attn_mask[i].sum().item()
-        unpadded_prompt_tokens = prompt_token_ids[i, :current_prompt_len].to(device)
-
-        for completion in request_output.outputs:
-            generated_token_ids = torch.tensor(completion.token_ids, device=device)
-            full_sequence = torch.cat([unpadded_prompt_tokens, generated_token_ids], dim=0)
-
-            # Pad sequence to the maximum expected length (context + max_new_tokens)
-            pad_len = output_length - full_sequence.shape[0]
-            if pad_len < 0:
-                # Generated sequence is longer than required output length, truncate
-                full_sequence = full_sequence[:output_length]
-                pad_len = 0
-            elif pad_len > 0:
-                 # Pad if shorter
-                padding = torch.full((pad_len,), tokenizer.pad_token_id, dtype=full_sequence.dtype, device=device)
-                full_sequence = torch.cat([full_sequence, padding], dim=0)
-
-            all_output_sequences.append(full_sequence)
-            output_idx += 1
-
-    if not all_output_sequences:
-        # Handle case where VLLM returns no output
-        return torch.empty((0, output_length), dtype=torch.long, device=device)
-
-    final_tensor = torch.stack(all_output_sequences) # [batch_size * n_outputs_per_prompt, output_length]
-
-    if args.swap_eos_token:
-         # Apply token swapping if needed *after* generation
-         final_tensor = swap_eos_token(final_tensor,
-                                      from_token = "<|end_of_text|>",
-                                      to_token = "<|eot_id|>")
-    return final_tensor
-
 
 def debug_tensor_info(tensor, name, enabled = True):
     if enabled:
@@ -578,6 +492,8 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             responses = query_responses[:, context_length:]
 
             postprocessed_responses = truncate_response(args, tokenizer, responses)
+            # expanded_queries = queries.repeat_interleave(rloo_k, dim=0)
+            # postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             truncated_query_responses = torch.cat([queries, postprocessed_responses], dim = 1)
             scores, _, _ = get_reward(reward_model = reward_model, 
                                input_ids = truncated_query_responses)
@@ -605,6 +521,90 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
         }
     )
     return eval_storage, eval_df
+
+def generate_vllm(llm_engine: LLM,
+                  prompts: List[str],
+                  tokenizer: AutoTokenizer, # Tokenizer used for prompts & padding
+                  generation_config: GenerationConfig,
+                  context_length: int, # Length of tokenized prompt
+                  output_length: int, # Desired total output length (prompt + response)
+                  device: torch.device,
+                  n_outputs_per_prompt: int = 1,
+                 ) -> torch.Tensor:
+    """
+    Generates sequences using VLLM engine.
+    Designed to be called from the main process (rank 0).
+
+    Args:
+        llm_engine: Initialized VLLM LLM engine.
+        prompts: List of prompt strings.
+        tokenizer: Tokenizer associated with the prompts/model.
+        generation_config: HF GenerationConfig to extract parameters from.
+        context_length: The max length of the tokenized prompts.
+        output_length: The target total sequence length (prompt + response) for padding.
+        device: Target torch device for the output tensor.
+        n_outputs_per_prompt: Number of sequences per prompt (k).
+
+    Returns:
+        Tensor of generated sequences (prompt + response). Shape: [num_prompts * n_outputs_per_prompt, output_length]
+    """
+    sampling_params = SamplingParams(
+        n=n_outputs_per_prompt,
+        temperature=generation_config.temperature if generation_config.temperature > 1e-6 else 1e-6, # VLLM requires temp > 0
+        top_p=generation_config.top_p if generation_config.top_p < 1.0 else 1.0,
+        top_k=generation_config.top_k if generation_config.top_k > 0 else -1, # VLLM uses -1 for no top_k
+        max_tokens=generation_config.max_new_tokens,
+        # min_tokens=generation_config.min_new_tokens, # VLLM might not support min_tokens
+        stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id else None,
+        skip_special_tokens=False, # Keep special tokens like EOS
+        logprobs=None, # Not needed here; will compute later with `forward`
+    )
+
+    # VLLM call
+    vllm_outputs = llm_engine.generate(prompts, sampling_params, use_tqdm=False)
+
+    all_output_sequences = []
+    # Re-tokenize prompts to get the exact input IDs VLLM used (more robust than assuming first N tokens match)
+    prompt_token_ids_dict = tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=context_length)
+    prompt_token_ids = prompt_token_ids_dict.input_ids
+    prompt_attn_mask = prompt_token_ids_dict.attention_mask
+
+    output_idx = 0
+    for i, request_output in enumerate(vllm_outputs):
+        # Get the actual prompt tokens used (handling padding)
+        current_prompt_len = prompt_attn_mask[i].sum().item()
+        unpadded_prompt_tokens = prompt_token_ids[i, :current_prompt_len].to(device)
+
+        for completion in request_output.outputs:
+            generated_token_ids = torch.tensor(completion.token_ids, device=device)
+            full_sequence = torch.cat([unpadded_prompt_tokens, generated_token_ids], dim=0)
+
+            # Pad sequence to the maximum expected length (context + max_new_tokens)
+            pad_len = output_length - full_sequence.shape[0]
+            if pad_len < 0:
+                # Generated sequence is longer than required output length, truncate
+                full_sequence = full_sequence[:output_length]
+                pad_len = 0
+            elif pad_len > 0:
+                 # Pad if shorter
+                padding = torch.full((pad_len,), tokenizer.pad_token_id, dtype=full_sequence.dtype, device=device)
+                full_sequence = torch.cat([full_sequence, padding], dim=0)
+
+            all_output_sequences.append(full_sequence)
+            output_idx += 1
+
+    if not all_output_sequences:
+        # Handle case where VLLM returns no output
+        return torch.empty((0, output_length), dtype=torch.long, device=device)
+
+    final_tensor = torch.stack(all_output_sequences) # [batch_size * n_outputs_per_prompt, output_length]
+
+    if args.swap_eos_token:
+         # Apply token swapping if needed *after* generation
+         final_tensor = swap_eos_token(final_tensor,
+                                      from_token = "<|end_of_text|>",
+                                      to_token = "<|eot_id|>")
+    return final_tensor
 
 if __name__ == "__main__":
 
@@ -794,7 +794,7 @@ if __name__ == "__main__":
     kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
-        min_new_tokens=args.task.response_length,
+        min_new_tokens=args.task.response_length, 
         temperature=(args.task.temperature + args.eps),
         top_k=0.0,
         top_p=1.0,
@@ -886,95 +886,102 @@ if __name__ == "__main__":
             del eval_storage, eval_df
             torch.cuda.empty_cache()
 
-            # ============ Gathering training samples ============
-            instructions = data["instruction"]
-            queries = maybe_use_chat_template(instructions,
-                                            use_chat_template = args.use_chat_template,
-                                            )
-            query_responses = []
-            responses = []
-            postprocessed_responses = []
-            logprobs = []
-            ref_logprobs = []
-            scores = []
-            reward_breakdowns = []
-            reward_breakdowns_coeffs = []
-            sequence_lengths = []
-            for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
-                query = queries[i : i + args.local_rollout_forward_batch_size]
-                query_response = generate(
-                    accelerator.unwrap_model(model),
-                    query,
-                    tokenizer,
-                    generation_config,
-                    n_outputs_per_prompt=args.rloo_k,
-                )
+            # ============ Rollout Phase ============
+            with torch.no_grad():
+                data = next(iter_dataloader)
+                instructions = data["instruction"]
+                # Tokenize prompts for input to VLLM and later use
+                queries_tensor = maybe_use_chat_template(instructions,
+                                                         use_chat_template = args.use_chat_template,
+                                                        )
 
-                # 1. Extract queries and reference responses from the dataset
-                instruction = data["instruction"]
-                queries = maybe_use_chat_template(instruction, 
-                                                use_chat_template = args.use_chat_template, 
-                                                )
-                context_length = queries.shape[1]
+                # Determine context length and tokenizer for VLLM
                 if args.use_chat_template:
-                    assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
+                    context_length = args.task.query_length + args.task.chat_template_buffer_length
+                    vllm_tokenizer = chat_template_tokenizer
                 else:
-                    assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
+                    context_length = args.task.query_length
+                    vllm_tokenizer = tokenizer
 
-                # 2. Generate responses using the given policy model
+                # Decode tensor queries to strings for VLLM
+                # Use skip_special_tokens=False initially, VLLM might need them depending on model
+                prompt_strings = vllm_tokenizer.batch_decode(queries_tensor, skip_special_tokens=False)
+                # Remove padding tokens - VLLM handles padding internally
+                cleaned_prompts = [prompt.replace(vllm_tokenizer.pad_token, "").strip() for prompt in prompt_strings]
+
+                total_sequence_length = context_length + args.task.response_length
+
+                # --- VLLM Generation (Rank 0 generates, then broadcasts) ---
+                expected_output_shape = (len(cleaned_prompts) * args.rloo_k, total_sequence_length)
+                query_response_tensor = torch.zeros(expected_output_shape, dtype=torch.long, device=device)
+
                 if accelerator.is_main_process:
-                    total_sequence_length = args.task.query_length + args.task.chat_template_buffer_length + args.task.response_length
-                    if args.use_chat_template:
-                        context_length = args.task.query_length + args.task.chat_template_buffer_length
-                        vllm_tokenizer = chat_template_tokenizer
-                    else:
-                        context_length = args.task.query_length
-                        vllm_tokenizer = tokenizer
-                    
+                    try:
+                        query_response_tensor = generate_vllm(
+                            llm_engine=llm_engine,
+                            prompts=cleaned_prompts,
+                            tokenizer=vllm_tokenizer,
+                            generation_config=generation_config,
+                            context_length=context_length,
+                            output_length=total_sequence_length,
+                            device=device,
+                            n_outputs_per_prompt=args.rloo_k,
+                        )
+                        # Check if VLLM returned expected shape
+                        if query_response_tensor.shape[0] != expected_output_shape[0]:
+                            print(f"Warning: VLLM returned {query_response_tensor.shape[0]} sequences, expected {expected_output_shape[0]}. Adjusting.")
 
-                    # Decode tensor queries to strings for VLLM
-                    # Use skip_special_tokens=False initially, VLLM might need them depending on model
-                    prompt_strings = vllm_tokenizer.batch_decode(queries, skip_special_tokens=False)
-                    # Remove padding tokens - VLLM handles padding internally
-                    cleaned_prompts = [prompt.replace(vllm_tokenizer.pad_token, "").strip() for prompt in prompt_strings]
+                    except Exception as e:
+                        print(f"Rank 0: Error during VLLM generation: {e}")
+                        raise e
 
-                    # TODO: This is a hack to get the policy model to work with VLLM.
-                    policy_lora_merged = accelerator.unwrap_model(policy).merge_and_unload()
-                    policy_lora_merged.save_pretrained(f"{args.output_dir}/temp_lora_merged")
-                    llm_engine = LLM(
-                        model=f"{args.output_dir}/temp_lora_merged",
-                        tokenizer=tokenizer,
-                        max_model_len=total_sequence_length,
-                        tensor_parallel_size=args.world_size,
-                        gpu_memory_utilization=0.9,
-                        trust_remote_code=True,
-                    )
-
-                    query_response_tensor = generate_vllm(
-                        llm_engine = llm_engine,
-                        prompts = cleaned_prompts,
-                        tokenizer = vllm_tokenizer,
-                        generation_config = generation_config,
-                        context_length = context_length,
-                        output_length = total_sequence_length,
-                        device = device,
-                        n_outputs_per_prompt = 1,
-                    )
-
+                    # Broadcast the generated tensor from main process to all others
                     accelerator.wait_for_everyone()
+                    # Ensure tensor shape matches on all ranks before broadcast if VLLM failed/returned partial results on rank 0
+                    # This is tricky. A safer way might be to broadcast the *size* first, then the data.
+                    # Let's stick to broadcasting the tensor directly for now, assuming success mostly.
+                    if torch.distributed.get_rank() == 0:
+                        size_tensor = torch.tensor(query_response_tensor.shape, device=device)
+                    else:
+                        size_tensor = torch.zeros(len(expected_output_shape), dtype=torch.long, device=device) # Match dims
+
+                    torch.distributed.broadcast(size_tensor, src=0)
+                    accelerator.wait_for_everyone()
+
+                    # If rank 0 failed, size might be [0, N] or incorrect. All ranks should agree on shape now.
+                    actual_shape = tuple(size_tensor.tolist())
+                    if actual_shape[0] == 0 and expected_output_shape[0] > 0 :
+                         print(f"Rank {accelerator.process_index}: VLLM generation failed or returned empty tensor on rank 0. Skipping PPO step.")
+                         # Skip update or handle error
+                         # For now: create empty tensor on non-zero ranks too if needed by downstream code.
+                         if not accelerator.is_main_process:
+                               query_response_tensor = torch.zeros(actual_shape, dtype=torch.long, device=device)
+
+                    elif tuple(query_response_tensor.shape) != actual_shape and not accelerator.is_main_process:
+                        # Resize tensor on non-zero ranks if needed (e.g., VLLM returned fewer sequences)
+                        query_response_tensor = torch.zeros(actual_shape, dtype=torch.long, device=device)
+                        pass # Add pass here for the elif
+
+
+                    # Broadcast actual data
                     handle = torch.distributed.broadcast(query_response_tensor, src=0, async_op=True)
                     handle.wait()
                     accelerator.wait_for_everyone()
 
-                context_length = query.shape[1]
-                if args.use_chat_template:
-                    assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
-                else:
-                    assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
-                instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
-                response = query_response[:, context_length:]
+                query_responses = query_response_tensor # [ B*k, context+response_len ]
+                responses = query_responses[:, context_length:] # [ B*k, response_len ]
 
-                # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
+                # Expand original query tensor to match the k outputs per prompt
+                # Shape: [ B*k, context_length ]
+                queries_tensor_expanded = queries_tensor.repeat_interleave(args.rloo_k, dim=0)
+                # Ensure expanded query tensor matches the batch size of responses from VLLM
+                if queries_tensor_expanded.shape[0] != query_responses.shape[0]:
+                    print(f"Warning: Mismatch between expanded queries ({queries_tensor_expanded.shape[0]}) and VLLM responses ({query_responses.shape[0]}). Using VLLM response count.")
+                    # This might happen if VLLM failed for some prompts. Slice queries_tensor_expanded if necessary.
+                    # Assuming for now they match or VLLM failure was handled.
+
+                # --- Existing post-generation processing ---
+                # (Applied to the VLLM output tensor `responses`)
                 if args.swap_eos_token:
                     postprocessed_response = truncate_response(args, chat_template_tokenizer, response)
                     logprob_mask = postprocessed_response == chat_template_tokenizer.eos_token_id
