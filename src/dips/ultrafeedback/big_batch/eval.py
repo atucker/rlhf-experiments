@@ -6,8 +6,9 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, GenerationConfig
 from accelerate import Accelerator
 from dips.ultrafeedback.big_batch.config import Args
-from dips.ultrafeedback.big_batch.utils import maybe_use_chat_template, truncate_response
-from dips.ultrafeedback.big_batch.model import generate
+from dips.ultrafeedback.big_batch.tokenization_utils import maybe_use_chat_template
+from dips.ultrafeedback.big_batch.tensor_ops import truncate_response
+from dips.ultrafeedback.big_batch.generate import generate
 from dips.ultrafeedback.big_batch.reward import get_reward
 import torch.nn as nn
 from accelerate.utils import gather_object
@@ -31,7 +32,6 @@ class EvalStorage:
 
 def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: AutoTokenizer,
              dataloader: DataLoader, generation_config: GenerationConfig, sampling=True,
-             max_eval_size = float('inf'),
              accelerator: Accelerator = None) -> Tuple[EvalStorage, pd.DataFrame]:
     """
     Completes an episode rollout for the policy model and returns:
@@ -46,8 +46,11 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
         for data in dataloader:
             # 1. Extract queries and reference responses from the dataset
             instruction = data["instruction"]
-            queries = maybe_use_chat_template(instruction, 
+            queries = maybe_use_chat_template(instruction = instruction, 
                                               use_chat_template = args.use_chat_template, 
+                                              tokenizer = tokenizer,
+                                              args = args,
+                                              device = accelerator.device,
                                               )
             context_length = queries.shape[1]
             if args.use_chat_template:
@@ -61,6 +64,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
                 queries = queries,
                 tokenizer = tokenizer,
                 generation_config = generation_config,
+                args = args,
                 n_outputs_per_prompt = 1,
             ) # [batch_size * n_outputs_per_prompt, prompt_len + response_len]
 
@@ -69,7 +73,8 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
             postprocessed_responses = truncate_response(args, tokenizer, responses)
             truncated_query_responses = torch.cat([queries, postprocessed_responses], dim = 1)
             scores, _, _ = get_reward(reward_model = reward_model, 
-                               input_ids = truncated_query_responses)
+                               input_ids = truncated_query_responses,
+                               tokenizer = tokenizer)
             eval_storage.query_token.extend(queries)
             eval_storage.postprocessed_response_token.extend(postprocessed_responses)
             eval_storage.score.append(scores)
@@ -78,7 +83,7 @@ def evaluate(args: Args, reward_model: nn.Module, policy: nn.Module, tokenizer: 
                 break
 
             counter += 1
-            if counter >= max_eval_size:
+            if counter >= args.max_eval_size:
                 break
 
     eval_storage.query = tokenizer.batch_decode(eval_storage.query_token, skip_special_tokens=True)

@@ -1,21 +1,17 @@
 # TODO: Port updates to kl.py over
 
 import os
-import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from types import SimpleNamespace
 from collections import defaultdict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.optim as optim
 import tyro
 import wandb
 from accelerate import Accelerator
-from datasets import load_dataset
-from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 
@@ -44,6 +40,7 @@ from dips.ultrafeedback.big_batch.tensor_ops import configure_dropout, truncate_
 from dips.ultrafeedback.big_batch.model import initialize_policy_with_optimizer
 from dips.ultrafeedback.big_batch.data import get_dataloaders
 from dips.ultrafeedback.big_batch.generate import generate_vllm, forward
+from dips.ultrafeedback.big_batch.reward import get_reward
 
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
@@ -216,7 +213,6 @@ if __name__ == "__main__":
         frac = 1.0 - ((update - 1.0) / args.ppo.num_updates)
         lrnow = frac * args.lr # linear learning rate decay
         optimizer.param_groups[0]["lr"] = lrnow
-        data = next(iter_dataloader)
         with torch.no_grad():
             eval_storage, eval_df = evaluate(
                 args = args,
@@ -225,6 +221,7 @@ if __name__ == "__main__":
                 tokenizer = tokenizer,
                 dataloader = validation_dataloader,
                 generation_config = validation_generation_config,
+                accelerator = accelerator,
             )
             validation_score = eval_storage.score[0]
             if args.print_sample_output_freq > 0 and update > 1 and (update - 1) % args.print_sample_output_freq == 0:
@@ -246,7 +243,7 @@ if __name__ == "__main__":
                         validation_dataloader,
                         validation_generation_config,
                         sampling=False,
-                        max_eval_size = args.max_eval_size,
+                        accelerator = accelerator,
                     )
                     if accelerator.is_main_process:
                         eval_df.to_csv(f"runs/{run_name}/table.csv")
@@ -283,9 +280,13 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
 
             # ============ Gathering training samples ============
+            data = next(iter_dataloader)
             instructions = data["instruction"]
             queries = maybe_use_chat_template(instructions,
                                             use_chat_template = args.use_chat_template,
+                                            tokenizer = tokenizer,
+                                            args = args,
+                                            device = device,
                                             )
             query_responses = []
             responses = []
@@ -296,79 +297,54 @@ if __name__ == "__main__":
             reward_breakdowns = []
             reward_breakdowns_coeffs = []
             sequence_lengths = []
-            for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
-                query = queries[i : i + args.local_rollout_forward_batch_size]
-                # query_response = generate(
-                #     accelerator.unwrap_model(model),
-                #     query,
-                #     tokenizer,
-                #     generation_config,
-                #     n_outputs_per_prompt=args.rloo_k,
-                # )
 
-                # 1. Extract queries and reference responses from the dataset
-                instruction = data["instruction"]
-                queries = maybe_use_chat_template(instruction, 
-                                                use_chat_template = args.use_chat_template, 
-                                                )
-                context_length = queries.shape[1]
+            # 1. Extract queries and reference responses from the dataset
+            instruction = data["instruction"]
+            queries = maybe_use_chat_template(instruction, 
+                                            use_chat_template = args.use_chat_template, 
+                                            tokenizer = tokenizer,
+                                            args = args,
+                                            device = device,
+                                            )
+            context_length = queries.shape[1]
+            if args.use_chat_template:
+                assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
+            else:
+                assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
+
+            # 2. Generate responses using the given policy model
+            if accelerator.is_main_process:
+                total_sequence_length = args.task.query_length + args.task.chat_template_buffer_length + args.task.response_length
                 if args.use_chat_template:
-                    assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
+                    context_length = args.task.query_length + args.task.chat_template_buffer_length
+                    vllm_tokenizer = chat_template_tokenizer
                 else:
-                    assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
+                    context_length = args.task.query_length
+                    vllm_tokenizer = tokenizer
 
-                # 2. Generate responses using the given policy model
-                if accelerator.is_main_process:
-                    total_sequence_length = args.task.query_length + args.task.chat_template_buffer_length + args.task.response_length
-                    if args.use_chat_template:
-                        context_length = args.task.query_length + args.task.chat_template_buffer_length
-                        vllm_tokenizer = chat_template_tokenizer
-                    else:
-                        context_length = args.task.query_length
-                        vllm_tokenizer = tokenizer
-                    
+                # Decode tensor queries to strings for VLLM
+                # Use skip_special_tokens=False initially, VLLM might need them depending on model
+                prompt_strings = vllm_tokenizer.batch_decode(queries, skip_special_tokens=False)
+                # Remove padding tokens - VLLM handles padding internally
+                cleaned_prompts = [prompt.replace(vllm_tokenizer.pad_token, "").strip() for prompt in prompt_strings]
 
-                    # Decode tensor queries to strings for VLLM
-                    # Use skip_special_tokens=False initially, VLLM might need them depending on model
-                    prompt_strings = vllm_tokenizer.batch_decode(queries, skip_special_tokens=False)
-                    # Remove padding tokens - VLLM handles padding internally
-                    cleaned_prompts = [prompt.replace(vllm_tokenizer.pad_token, "").strip() for prompt in prompt_strings]
+                response_tensor = generate_vllm(
+                    policy = accelerator.unwrap_model(model),
+                    accelerator = accelerator,
+                    prompts = cleaned_prompts,
+                    tokenizer = vllm_tokenizer,
+                    generation_config = generation_config,
+                    context_length = context_length,
+                    output_length = total_sequence_length,
+                    device = device,
+                    args = args,
+                    n_outputs_per_prompt = 1,
+                )
 
-                    # TODO: This is a hack to get the policy model to work with VLLM.
-                    policy_lora_merged = accelerator.unwrap_model(policy).merge_and_unload()
-                    policy_lora_merged.save_pretrained(f"{args.output_dir}/temp_lora_merged")
-                    llm_engine = LLM(
-                        model=f"{args.output_dir}/temp_lora_merged",
-                        tokenizer=tokenizer,
-                        max_model_len=total_sequence_length,
-                        tensor_parallel_size=args.world_size,
-                        gpu_memory_utilization=0.9,
-                        trust_remote_code=True,
-                    )
-
-                    query_response_tensor = generate_vllm(
-                        llm_engine = llm_engine,
-                        prompts = cleaned_prompts,
-                        tokenizer = vllm_tokenizer,
-                        generation_config = generation_config,
-                        context_length = context_length,
-                        output_length = total_sequence_length,
-                        device = device,
-                        n_outputs_per_prompt = 1,
-                    )
-
-                    accelerator.wait_for_everyone()
-                    handle = torch.distributed.broadcast(query_response_tensor, src=0, async_op=True)
-                    handle.wait()
-                    accelerator.wait_for_everyone()
-
-                context_length = query.shape[1]
-                if args.use_chat_template:
-                    assert context_length == args.task.query_length + args.task.chat_template_buffer_length, f"Context length {context_length} does not match query length {args.task.query_length + args.task.chat_template_buffer_length}"
-                else:
-                    assert context_length == args.task.query_length, f"Context length {context_length} does not match query length {args.task.query_length}"
-                instruction_batch = instructions[i : i + args.local_rollout_forward_batch_size]
-                response = query_response[:, context_length:]
+                accelerator.wait_for_everyone()
+                # Broadcast the generated responses from the main process to all other processes
+                response_tensor = accelerator.broadcast(response_tensor, from_process=0)
+                accelerator.wait_for_everyone()
 
                 # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
                 if args.swap_eos_token:
@@ -379,7 +355,6 @@ if __name__ == "__main__":
                     logprob_mask = postprocessed_response == tokenizer.pad_token_id
                 sequence_length = first_true_indices(logprob_mask) - 1
 
-                debug_tensor_info(query_response, "query_response", enabled=args.debug_tensor_info)
                 output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
                 if accelerator.is_main_process and accelerator.is_local_main_process and args.track:
                     wandb.config.update({"model/output_dtype": str(output.logits.dtype)})
@@ -416,7 +391,8 @@ if __name__ == "__main__":
                 #     repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
                 truncated_query_response = torch.cat([query_response[:, :context_length], postprocessed_response], dim = 1)
                 score, reward_breakdown, reward_breakdown_coeffs = get_reward(reward_model = reward_model, 
-                                input_ids = truncated_query_response)
+                                input_ids = truncated_query_response,
+                                tokenizer = tokenizer)
 
                 query_responses.append(query_response)
                 responses.append(response)

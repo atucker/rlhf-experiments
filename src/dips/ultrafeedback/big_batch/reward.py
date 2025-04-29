@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-from dips.ultrafeedback.big_batch.tokenization_utils import swap_eos_token
-from dips.ultrafeedback.big_batch.config import Args
+from transformers import AutoTokenizer
 
 def get_reward(reward_model: nn.Module, 
                input_ids: torch.Tensor,

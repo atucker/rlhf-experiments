@@ -1,5 +1,5 @@
 from dips.ultrafeedback.big_batch.config import Args
-from dips.ultrafeedback.big_batch.utils import filter_by_length
+from dips.ultrafeedback.big_batch.tensor_ops import filter_by_length
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -13,7 +13,7 @@ def get_dataloaders(args: Args, tokenizer: AutoTokenizer):
     dataset = dataset.filter(filter_by_length,
                              fn_kwargs = {"tokenizer": tokenizer, "max_length": args.task.query_length})
     
-    dataloader = DataLoader(dataset, batch_size=args.local_rollout_forward_batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=args.per_device_rollout_batch_size, shuffle=True)
     validation_dataset = validation_dataset.with_format("torch", columns=["instruction"])
     validation_dataset = validation_dataset.filter(filter_by_length,
                                                    fn_kwargs = {"tokenizer": tokenizer, 

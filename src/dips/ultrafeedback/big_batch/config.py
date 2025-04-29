@@ -64,7 +64,7 @@ class Args:
     """the name of this experiment"""
     seed: int = 55134
     """seed of the experiment"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "llama_3_8b_ultrafeedback"
     """the wandb's project name"""
@@ -110,14 +110,15 @@ class Args:
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 4
+    per_device_rollout_batch_size: int = 64
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
+    local_rollout_forward_batch_size: int = 4
 
     total_episodes: int = int(6416) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
-    world_size: Optional[int] = 2
+    world_size: Optional[int] = 1
     """The number of processes (GPUs) to use"""
 
     # other args

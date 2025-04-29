@@ -1,9 +1,11 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-from dips.ultrafeedback.big_batch.config import Args, SamplingParams
+from dips.ultrafeedback.big_batch.config import Args
 from dips.ultrafeedback.big_batch.tokenization_utils import swap_eos_token
-from vllm import LLM
+from vllm import LLM, SamplingParams
 from typing import List
+from accelerate import Accelerator
+import gc
 
 def forward(model: AutoModelForCausalLM, 
             responses: torch.Tensor, 
@@ -76,7 +78,8 @@ def generate(lm_backbone: AutoModelForCausalLM,
     full_sequences = torch.cat((expanded_queries, output.sequences[:, context_length:]), dim=1)
     return full_sequences
 
-def generate_vllm(llm_engine: LLM,
+def generate_vllm(policy: AutoModelForCausalLM,
+                  accelerator: Accelerator,
                   prompts: List[str],
                   tokenizer: AutoTokenizer, # Tokenizer used for prompts & padding
                   generation_config: GenerationConfig,
@@ -91,7 +94,7 @@ def generate_vllm(llm_engine: LLM,
     Designed to be called from the main process (rank 0).
 
     Args:
-        llm_engine: Initialized VLLM LLM engine.
+        policy: Model to use for generation.
         prompts: List of prompt strings.
         tokenizer: Tokenizer associated with the prompts/model.
         generation_config: HF GenerationConfig to extract parameters from.
@@ -103,6 +106,19 @@ def generate_vllm(llm_engine: LLM,
     Returns:
         Tensor of generated sequences (prompt + response). Shape: [num_prompts * n_outputs_per_prompt, output_length]
     """
+
+    # TODO: This is a hack to get the policy model to work with VLLM.
+    policy_lora_merged = accelerator.unwrap_model(policy).merge_and_unload()
+    policy_lora_merged.save_pretrained(f"{args.output_dir}/temp_lora_merged")
+    llm_engine = LLM(
+        model=f"{args.output_dir}/temp_lora_merged",
+        tokenizer=tokenizer.name_or_path,
+        max_model_len=output_length,
+        tensor_parallel_size=args.world_size,
+        gpu_memory_utilization=0.7,
+        trust_remote_code=True,
+    )
+    
     sampling_params = SamplingParams(
         n=n_outputs_per_prompt,
         temperature=generation_config.temperature if generation_config.temperature > 1e-6 else 1e-6, # VLLM requires temp > 0
@@ -159,4 +175,14 @@ def generate_vllm(llm_engine: LLM,
          final_tensor = swap_eos_token(final_tensor,
                                       from_token = "<|end_of_text|>",
                                       to_token = "<|eot_id|>")
+         
+    # ======= Memory Cleanup =======
+    del policy_lora_merged
+    del llm_engine
+    del vllm_outputs
+    del all_output_sequences
+    del prompt_token_ids
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     return final_tensor
