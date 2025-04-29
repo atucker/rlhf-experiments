@@ -26,43 +26,40 @@ from rich.pretty import pprint
 # Model
 from transformers import (
     AutoConfig,
-    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     GenerationConfig,
     PreTrainedModel,
-    get_scheduler,
 )
-from peft import get_peft_model, LoraConfig
 import warnings
 
 # Package imports
-from dips.tldr.utils import set_seed, get_grad_norms, configure_dropout, filter_by_length, print_rich_table
+from dips.tldr.utils import set_seed
 from dips.ultrafeedback.big_batch.config import Args
-from dips.ultrafeedback.big_batch.model import PrecisionModel
-from dips.ultrafeedback.big_batch.utils import force_clear_grads
 from dips.ultrafeedback.big_batch.tokenization_utils import maybe_use_chat_template
 from dips.ultrafeedback.big_batch.eval import evaluate
 from dips.ultrafeedback.big_batch.misc import AdaptiveKLController
+from dips.ultrafeedback.big_batch.logging_utils import GradNormLogger, print_rich_table, parse_reward_breakdown_attributes
+from dips.ultrafeedback.big_batch.tensor_ops import configure_dropout, truncate_response, first_true_indices, debug_tensor_info, force_clear_grads
+from dips.ultrafeedback.big_batch.model import initialize_policy_with_optimizer
+from dips.ultrafeedback.big_batch.data import get_dataloaders
+from dips.ultrafeedback.big_batch.generate import generate_vllm, forward
 
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
 if __name__ == "__main__":
 
+    # ========= Setup =========
     args = tyro.cli(Args)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps) 
-    #                           ^ Necessary for the policy-value wrapper trick we pull
+
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
     set_seed(local_seed)
+    torch.backends.cudnn.deterministic = True
 
     args.world_size = accelerator.num_processes
     args.batch_size = args.per_device_train_batch_size * args.world_size
-    # args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
-    # if args.ppo.whiten_rewards:
-    #     assert (
-    #         args.local_batch_size >= 8
-    #     ), f"Per-rank minibatch size {args.local_batch_size} is insufficient for whitening"
-    #     # raise NotImplementedError("Whitening is not supported at the moment.")
+
     if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size) != 0:
         warnings.warn("local_rollout_forward_batch_size * rloo_k is not divisible by batch_size (gradient accumulation will require memory for the remainder)")
 
@@ -111,19 +108,22 @@ if __name__ == "__main__":
     if args.task.truncate_token == "eos":
         args.task.truncate_token_id = tokenizer.eos_token_id
 
-    console = Console(force_terminal=True)
-
     # Add train type annotation to the experiment name
     if args.train_dips:
-        args.exp_name = f"{args.exp_name}_dips"
-        args.output_dir = f"{args.output_dir}_dips"
+        final_exp_name = f"{args.exp_name}_dips"
+        algo_subdir = "dips"
+        final_output_dir = os.path.join(args.output_dir, algo_subdir)
     else:
-        args.exp_name = f"{args.exp_name}_rloo"
-        args.output_dir = f"{args.output_dir}_rloo"
-    run_name = f"{args.exp_name}__{args.seed}__{args.output_dir.split('/')[1]}"
-    writer = SimpleNamespace()  # dummy writer
-    writer.add_scalar = lambda x, y, z: None
-    writer.add_histogram = lambda x, y, z: None
+        final_exp_name = f"{args.exp_name}_rloo"
+        algo_subdir = "rloo"
+        final_output_dir = os.path.join(args.output_dir, algo_subdir)
+    os.makedirs(final_output_dir, exist_ok=True)
+
+    run_name = f"{final_exp_name}__{args.seed}__{algo_subdir}"
+
+    # ========= Logging =========
+    console = Console(force_terminal=True)
+    grad_norm_logger = GradNormLogger()
     if accelerator.is_main_process:
         if args.track:
             wandb.init(
@@ -143,9 +143,14 @@ if __name__ == "__main__":
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         pprint(args)
-    device = accelerator.device
-    torch.backends.cudnn.deterministic = True
+    else:
+        writer = SimpleNamespace()  # dummy writer
+        writer.add_scalar = lambda x, y, z: None
+        writer.add_histogram = lambda x, y, z: None
 
+    device = accelerator.device
+
+    # ========= Model =========
     model_config = AutoConfig.from_pretrained(args.base_model)
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
     assert args.reward_model_path, "reward_model_path must be provided"
@@ -160,61 +165,10 @@ if __name__ == "__main__":
         pprint(model_config)
         pprint(reward_model.config)
 
-    if args.unembed_full_precision:
-        policy = PrecisionModel.from_pretrained(args.sft_model_path,
-                                                config=model_config,
-                                                trust_remote_code=True,
-                                                low_cpu_mem_usage = True)
-    else:
-        policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
-                                                    config=model_config, 
-                                                    trust_remote_code=True,
-                                                    torch_dtype="auto",
-                                                    low_cpu_mem_usage = True)
-    
-    # Freeze the policy model base weights
-    for param in policy.parameters():
-        param.requires_grad = False
+    policy, optimizer, scheduler = initialize_policy_with_optimizer(args, model_config, accelerator, grad_norm_logger)
 
-    peft_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
-
-    policy = get_peft_model(policy, peft_config=peft_config)
-    param_subset = [param for param in policy.parameters() if param.requires_grad]
-    accelerator.print(policy)
-    policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
-    policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    
-    if args.optimizer == "adam":
-        optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=args.eps)
-    elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
-
-    scheduler = get_scheduler(
-        args.scheduler,
-        optimizer = optimizer,
-        num_warmup_steps = args.warm_up_steps,
-        num_training_steps = args.ppo.num_updates,
-    )
-
-    dataset = load_dataset(args.task.query_dataset, split="train")
-    train_val_split = dataset.train_test_split(test_size=0.1, seed=args.seed) # use a consistent seed across runs
-    dataset, validation_dataset = train_val_split["train"], train_val_split["test"]
-    dataset = dataset.with_format("torch", columns=["instruction"])
-
-    dataset = dataset.filter(filter_by_length,
-                             fn_kwargs = {"tokenizer": tokenizer, "max_length": args.task.query_length})
-    
-    dataloader = DataLoader(dataset, batch_size=args.local_rollout_forward_batch_size, shuffle=True)
-    validation_dataset = validation_dataset.with_format("torch", columns=["instruction"])
-    validation_dataset = validation_dataset.filter(filter_by_length,
-                                                   fn_kwargs = {"tokenizer": tokenizer, 
-                                                                  "max_length": args.task.query_length})
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.per_device_eval_batch_size)
+    # ========= Data =========
+    dataloader, validation_dataloader = get_dataloaders(args, tokenizer)
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
@@ -252,6 +206,7 @@ if __name__ == "__main__":
     )
     # Note: Don't add eos_token_id to the above generation configs - we don't want to avoid generating the eos token.
 
+    # ========= Main Training Loop =========
     global_step = 0
     start_time = time.time()
 
@@ -609,16 +564,10 @@ if __name__ == "__main__":
 
                     # Grab model grad norms
                     if args.train_dips and args.factor_loss:
-                        policy_term_grad_norms = get_grad_norms(loss = policy_loss_term,
-                                                                params = param_subset,
-                                                                device = device)
-                        kl_term_grad_norms = get_grad_norms(loss = kl_loss_term,
-                                                            params = param_subset,
-                                                            device = device)
+                        policy_term_grad_norms = grad_norm_logger.get_grad_norms(loss = policy_loss_term)
+                        kl_term_grad_norms = grad_norm_logger.get_grad_norms(loss = kl_loss_term)
 
-                    grad_norms = get_grad_norms(loss = loss,
-                                                params = param_subset, 
-                                                device = device)
+                    grad_norms = grad_norm_logger.get_grad_norms(loss = loss)
 
                     accelerator.backward(loss)
                     if args.clip_grad_norm is not None and accelerator.sync_gradients:

@@ -3,6 +3,14 @@ from accelerate.state import DistributedType
 from transformers import AutoTokenizer
 import numpy as np
 
+# taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
+def configure_dropout(model_config, dropout_layer_keys, dropout):
+    if dropout is not None:
+        for key in dropout_layer_keys:
+            if hasattr(model_config, key):
+                print(f"Setting model_config.{key} to {dropout}")
+                setattr(model_config, key, dropout)
+                
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.normal_(layer.weight, std=std)
     torch.nn.init.constant_(layer.bias, val=bias_const)

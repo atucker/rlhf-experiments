@@ -4,14 +4,6 @@ from rich.console import Console
 from rich.table import Table
 from typing import Tuple, Dict
 
-# taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
-def configure_dropout(model_config, dropout_layer_keys, dropout):
-    if dropout is not None:
-        for key in dropout_layer_keys:
-            if hasattr(model_config, key):
-                print(f"Setting model_config.{key} to {dropout}")
-                setattr(model_config, key, dropout)
-
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     table = Table(show_lines=True)
     for column in df.columns:
@@ -34,3 +26,23 @@ def parse_reward_breakdown_attributes(reward_breakdown: torch.Tensor, reward_bre
         reward_breakdown_dict[elem] = reward_breakdown[:, index].mean().item()
         reward_breakdown_coeffs_dict[elem] = reward_breakdown_coeffs[:, index].mean().item()
     return reward_breakdown_dict, reward_breakdown_coeffs_dict
+
+class GradNormLogger:
+    def __init__(self, device = "cpu"):
+        self.tracked_params = None
+        self.device = device
+
+    def setup(self, tracked_params: list):
+        self.tracked_params = tracked_params
+
+    def get_grad_norms(self, loss) -> torch.Tensor:
+        if self.tracked_params is None:
+            raise ValueError("GradNormLogger has not been setup with tracked parameters")
+        grad = torch.autograd.grad(
+            outputs = loss,
+            inputs = self.tracked_params,
+            create_graph = False,
+            retain_graph = True,
+        )
+        grad_norms = torch.tensor([g.norm() for g in grad])
+        return grad_norms
