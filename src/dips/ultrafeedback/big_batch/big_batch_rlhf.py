@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import tyro
 import wandb
 from accelerate import Accelerator
+import accelerate
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 
@@ -343,7 +344,7 @@ if __name__ == "__main__":
 
                 accelerator.wait_for_everyone()
                 # Broadcast the generated responses from the main process to all other processes
-                response_tensor = accelerator.broadcast(response_tensor, from_process=0)
+                response_tensor = accelerate.utils.broadcast(response_tensor, from_process=0)
                 accelerator.wait_for_everyone()
 
                 # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
