@@ -107,9 +107,17 @@ def generate_vllm(policy: AutoModelForCausalLM,
         Tensor of generated sequences (prompt + response). Shape: [num_prompts * n_outputs_per_prompt, output_length]
     """
 
+    # Offload model to CPU - leave VRAM for VLLM engine
+    policy.to("cpu")
+
     # TODO: This is a hack to get the policy model to work with VLLM.
     policy_lora_merged = accelerator.unwrap_model(policy).merge_and_unload()
     policy_lora_merged.save_pretrained(f"{args.output_dir}/temp_lora_merged")
+
+    del policy_lora_merged
+    gc.collect()
+    torch.cuda.empty_cache()
+
     llm_engine = LLM(
         model=f"{args.output_dir}/temp_lora_merged",
         tokenizer=tokenizer.name_or_path,
@@ -125,7 +133,7 @@ def generate_vllm(policy: AutoModelForCausalLM,
         top_p=generation_config.top_p if generation_config.top_p < 1.0 else 1.0,
         top_k=generation_config.top_k if generation_config.top_k > 0 else -1, # VLLM uses -1 for no top_k
         max_tokens=generation_config.max_new_tokens,
-        # min_tokens=generation_config.min_new_tokens, # VLLM might not support min_tokens
+        min_tokens=generation_config.min_new_tokens, # VLLM might not support min_tokens
         stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id else None,
         skip_special_tokens=False, # Keep special tokens like EOS
         logprobs=None, # Not needed here; will compute later with `forward`
@@ -138,32 +146,13 @@ def generate_vllm(policy: AutoModelForCausalLM,
     # Re-tokenize prompts to get the exact input IDs VLLM used (more robust than assuming first N tokens match)
     prompt_token_ids_dict = tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=context_length)
     prompt_token_ids = prompt_token_ids_dict.input_ids
-    prompt_attn_mask = prompt_token_ids_dict.attention_mask
 
-    output_idx = 0
     for i, request_output in enumerate(vllm_outputs):
-        # Get the actual prompt tokens used (handling padding)
-        current_prompt_len = prompt_attn_mask[i].sum().item()
-        unpadded_prompt_tokens = prompt_token_ids[i, :current_prompt_len].to(device)
-
         for completion in request_output.outputs:
             generated_token_ids = torch.tensor(completion.token_ids, device=device)
-            full_sequence = torch.cat([unpadded_prompt_tokens, generated_token_ids], dim=0)
-
-            # Pad sequence to the maximum expected length (context + max_new_tokens)
-            pad_len = output_length - full_sequence.shape[0]
-            if pad_len < 0:
-                # Generated sequence is longer than required output length, truncate
-                full_sequence = full_sequence[:output_length]
-                pad_len = 0
-            elif pad_len > 0:
-                 # Pad if shorter
-                padding = torch.full((pad_len,), tokenizer.pad_token_id, dtype=full_sequence.dtype, device=device)
-                full_sequence = torch.cat([full_sequence, padding], dim=0)
-
-            all_output_sequences.append(full_sequence)
-            output_idx += 1
-
+            assert generated_token_ids.shape[0] == generation_config.max_new_tokens
+            all_output_sequences.append(generated_token_ids)
+    
     if not all_output_sequences:
         # Handle case where VLLM returns no output
         return torch.empty((0, output_length), dtype=torch.long, device=device)
@@ -177,12 +166,13 @@ def generate_vllm(policy: AutoModelForCausalLM,
                                       to_token = "<|eot_id|>")
          
     # ======= Memory Cleanup =======
-    del policy_lora_merged
     del llm_engine
     del vllm_outputs
     del all_output_sequences
     del prompt_token_ids
     gc.collect()
     torch.cuda.empty_cache()
+
+    policy.to(device)
     
     return final_tensor

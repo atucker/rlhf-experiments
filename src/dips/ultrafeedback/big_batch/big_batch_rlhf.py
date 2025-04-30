@@ -348,14 +348,16 @@ if __name__ == "__main__":
 
                 # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
                 if args.swap_eos_token:
-                    postprocessed_response = truncate_response(args, chat_template_tokenizer, response)
+                    postprocessed_response = truncate_response(args, chat_template_tokenizer, response_tensor)
                     logprob_mask = postprocessed_response == chat_template_tokenizer.eos_token_id
                 else:
-                    postprocessed_response = truncate_response(args, tokenizer, response)
+                    postprocessed_response = truncate_response(args, tokenizer, response_tensor)
                     logprob_mask = postprocessed_response == tokenizer.pad_token_id
                 sequence_length = first_true_indices(logprob_mask) - 1
 
-                output = forward(accelerator.unwrap_model(model), query_response, tokenizer)
+                query_response_tensor = torch.cat([queries, response_tensor], dim = 1)
+
+                output = forward(accelerator.unwrap_model(model), query_response_tensor, tokenizer)
                 if accelerator.is_main_process and accelerator.is_local_main_process and args.track:
                     wandb.config.update({"model/output_dtype": str(output.logits.dtype)})
 
@@ -364,21 +366,21 @@ if __name__ == "__main__":
                 # pad = torch.zeros(logits.shape[0], args.task.response_length-logits.shape[1], dtype = logits.dtype).to(device)
                 logits /= (args.task.temperature + args.eps)
                 all_logprob = F.log_softmax(logits, dim=-1)
-                logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                logprob = torch.gather(all_logprob, 2, query_response_tensor.unsqueeze(-1)).squeeze(-1)
 
                 if args.calculate_kl_on_truncated_responses:
                     # Mask out padding tokens (we don't want to calculate KL divergence on them)
                     logprob = torch.masked_fill(logprob, logprob_mask, 0)
                 del output, logits, all_logprob
 
-                ref_output = forward(accelerator.unwrap_model(model), query_response, tokenizer, ref=True)
+                ref_output = forward(accelerator.unwrap_model(model), query_response_tensor, tokenizer, ref=True)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
                 # Pad output sequence to response_length (necessary to avoid shape mismatch across devices)
                 # pad = torch.ones(ref_logits.shape[0], args.task.response_length-ref_logits.shape[1], dtype = ref_logits.dtype).to(device)
                 # ref_logits = torch.cat([ref_logits, pad], dim = 1)
                 ref_logits /= (args.task.temperature + args.eps)
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                ref_logprob = torch.gather(ref_all_logprob, 2, query_response_tensor.unsqueeze(-1)).squeeze(-1)
 
                 if args.calculate_kl_on_truncated_responses:
                     ref_logprob = torch.masked_fill(ref_logprob, logprob_mask, 0)
