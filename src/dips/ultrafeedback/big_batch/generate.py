@@ -107,9 +107,6 @@ def generate_vllm(policy: AutoModelForCausalLM,
         Tensor of generated sequences (prompt + response). Shape: [num_prompts * n_outputs_per_prompt, output_length]
     """
 
-    # Offload model to CPU - leave VRAM for VLLM engine
-    policy.to("cpu")
-
     # TODO: This is a hack to get the policy model to work with VLLM.
     policy_lora_merged = accelerator.unwrap_model(policy).merge_and_unload()
     policy_lora_merged.save_pretrained(f"{args.output_dir}/temp_lora_merged")
@@ -140,7 +137,7 @@ def generate_vllm(policy: AutoModelForCausalLM,
     )
 
     # VLLM call
-    vllm_outputs = llm_engine.generate(prompts, sampling_params, use_tqdm=False)
+    vllm_outputs = llm_engine.generate(prompts, sampling_params, use_tqdm=True)
 
     all_output_sequences = []
     # Re-tokenize prompts to get the exact input IDs VLLM used (more robust than assuming first N tokens match)
@@ -182,7 +179,5 @@ def generate_vllm(policy: AutoModelForCausalLM,
     del prompt_token_ids
     gc.collect()
     torch.cuda.empty_cache()
-
-    policy.to(device)
     
     return final_tensor

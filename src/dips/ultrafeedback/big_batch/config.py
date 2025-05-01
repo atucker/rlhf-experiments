@@ -110,7 +110,7 @@ class Args:
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     per_device_eval_batch_size: int = 4
     """per rank eval batch size"""
-    per_device_rollout_batch_size: int = 32
+    per_device_rollout_batch_size: int = 256
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
     local_rollout_forward_batch_size: int = 4
 

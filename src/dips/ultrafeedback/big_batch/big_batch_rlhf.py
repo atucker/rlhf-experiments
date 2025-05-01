@@ -320,6 +320,7 @@ if __name__ == "__main__":
                 # Remove padding tokens - VLLM handles padding internally
                 cleaned_prompts = [prompt.replace(vllm_tokenizer.pad_token, "").strip() for prompt in prompt_strings]
 
+                model.to("cpu")
                 response_tensor = generate_vllm(
                     policy = accelerator.unwrap_model(model),
                     accelerator = accelerator,
@@ -332,7 +333,9 @@ if __name__ == "__main__":
                     args = args,
                     n_outputs_per_prompt = args.rloo_k,
                 )
-            
+                model.to(device)
+                del vllm_tokenizer
+                
             accelerator.wait_for_everyone()
             # Broadcast the generated responses from the main process to all other processes
             response_tensor = accelerate.utils.broadcast(response_tensor, from_process=0)
@@ -431,8 +434,8 @@ if __name__ == "__main__":
             if args.rloo_k > 1:
                 # The shape of score is [batch_size * rloo_k]
                 per_prompt_scores = scores.reshape(-1, args.rloo_k)
-                per_prompt_logprobs = torch.sum(logprob, axis = 1).reshape(-1, args.rloo_k)
-                per_prompt_ref_logprobs = torch.sum(ref_logprob, axis = 1).reshape(-1, args.rloo_k)
+                per_prompt_logprobs = torch.sum(logprobs, axis = 1).reshape(-1, args.rloo_k)
+                per_prompt_ref_logprobs = torch.sum(ref_logprobs, axis = 1).reshape(-1, args.rloo_k)
                 per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
                 kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
                 score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
@@ -442,7 +445,7 @@ if __name__ == "__main__":
                 baselines = torch.zeros_like(scores)
 
             # 4. compute rewards
-            kl = logprob - ref_logprob # [batch_size, response_len]
+            kl = logprobs - ref_logprobs # [batch_size, response_len]
             non_score_reward = -kl_ctl.value * kl
             rewards = non_score_reward.clone()
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
@@ -477,6 +480,7 @@ if __name__ == "__main__":
         else:
             context_length = args.task.query_length
         
+        model.train()
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             local_batch_idxs = np.random.permutation(num_samples)
             for mini_batch_start in range(0, num_samples, args.per_device_train_batch_size):
@@ -487,8 +491,8 @@ if __name__ == "__main__":
                     mb_responses = response_tensor[mini_batch_inds] # [batch_size, response_len]
                     mb_query_responses = query_response_tensor[mini_batch_inds] # [batch_size, seq_len]
                     mb_postprocessed_responses = postprocessed_response[mini_batch_inds] # [batch_size, response_len]
-                    mb_logprobs = torch.sum(logprob[mini_batch_inds], axis=1) # [batch_size]
-                    mb_ref_logprobs = torch.sum(ref_logprob[mini_batch_inds], axis=1)
+                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1) # [batch_size]
+                    mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
                     mb_reward = scores[mini_batch_inds]
                     mb_baseline = baselines[mini_batch_inds]
 
@@ -503,14 +507,15 @@ if __name__ == "__main__":
                     # logits = torch.cat([logits, pad], dim = 1)
                     logits /= (args.task.temperature + args.eps)
                     new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
-                    # index logprobs over vocab dim by what the model actually generated
-                    new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                    # shape [batch_size] (total logprob of the response)
 
                     if args.swap_eos_token:
                         logprob_mask = mb_postprocessed_responses == chat_template_tokenizer.eos_token_id
                     else:
                         logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
+                    mb_responses_no_padding = torch.masked_fill(mb_responses, logprob_mask, 0)
+                    # index logprobs over vocab dim by what the model actually generated
+                    new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses_no_padding.unsqueeze(-1)).squeeze(-1)
+                    # shape [batch_size] (total logprob of the response)
                     new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
                     new_logprobs = torch.sum(new_logprobs, axis=1)
                     with torch.amp.autocast(device_type = "cuda",
@@ -539,11 +544,11 @@ if __name__ == "__main__":
                                 loss = loss + torch.mean(-1 * diff_reward)
 
                     # Grab model grad norms
-                    if args.train_dips and args.factor_loss:
-                        policy_term_grad_norms = grad_norm_logger.get_grad_norms(loss = policy_loss_term)
-                        kl_term_grad_norms = grad_norm_logger.get_grad_norms(loss = kl_loss_term)
+                    # if args.train_dips and args.factor_loss:
+                    #     policy_term_grad_norms = grad_norm_logger.get_grad_norms(loss = policy_loss_term)
+                    #     kl_term_grad_norms = grad_norm_logger.get_grad_norms(loss = kl_loss_term)
 
-                    grad_norms = grad_norm_logger.get_grad_norms(loss = loss)
+                    # grad_norms = grad_norm_logger.get_grad_norms(loss = loss)
 
                     accelerator.backward(loss)
                     if args.clip_grad_norm is not None and accelerator.sync_gradients:
@@ -556,24 +561,24 @@ if __name__ == "__main__":
                     # Do whatever logging we want
                     metrics["loss"][ppo_epoch_idx] += loss.detach().mean()
                     metrics["baseline"][ppo_epoch_idx] += mb_baseline.mean()
-                    metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
-                    metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
-                    metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
+                    # metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
+                    # metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
+                    # metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
                     metrics["penalty_frac"][ppo_epoch_idx] += penalty_frac.mean().item()
 
                     if args.train_dips:
                         metrics["weighting"][ppo_epoch_idx] += weighting.mean()
                         metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
                         metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
-                        if args.factor_loss:
-                            # No need to log kl and policy grad norms - they're both the same as the loss.
-                            # The distinction is in the gradient flow.
-                            metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
-                            metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
-                            metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
-                            metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
-                            metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
-                            metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
+                        # if args.factor_loss:
+                        #     # No need to log kl and policy grad norms - they're both the same as the loss.
+                        #     # The distinction is in the gradient flow.
+                        #     metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
+                        #     metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
+                        #     metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
+                        #     metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
+                        #     metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
+                        #     metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
                     else:
                         metrics["weighting"][ppo_epoch_idx] += weighting.mean()
                         metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
@@ -608,7 +613,7 @@ if __name__ == "__main__":
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
             
-            del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss, grad_norms
+            del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss #, grad_norms
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
             torch.cuda.empty_cache()
