@@ -8,7 +8,7 @@ from accelerate import Accelerator
 import gc
 
 def forward(model: AutoModelForCausalLM, 
-            responses: torch.Tensor, 
+            input_ids: torch.Tensor, 
             tokenizer: AutoTokenizer, 
             args: Args,
             ref: bool = False):
@@ -16,8 +16,8 @@ def forward(model: AutoModelForCausalLM,
     Get model output for given query_responses. 
     If ref is True, the model's adapter module is disabled (e.g peft models are reverted to their base models).
     """
-    attention_mask = responses != tokenizer.pad_token_id
-    input_ids = torch.masked_fill(responses, ~attention_mask, 0)
+    attention_mask = input_ids != tokenizer.pad_token_id
+    input_ids = torch.masked_fill(input_ids, ~attention_mask, 0)
     if args.swap_eos_token:
         input_ids = swap_eos_token(input_ids,
                                     from_token = "<|eot_id|>",
@@ -99,7 +99,7 @@ def generate_vllm(policy: AutoModelForCausalLM,
         tokenizer: Tokenizer associated with the prompts/model.
         generation_config: HF GenerationConfig to extract parameters from.
         context_length: The max length of the tokenized prompts.
-        output_length: The target total sequence length (prompt + response) for padding.
+        output_length: The target total sequence length (prompt + response) for VLLM's max_tokens.
         device: Target torch device for the output tensor.
         n_outputs_per_prompt: Number of sequences per prompt (k).
 
@@ -151,13 +151,10 @@ def generate_vllm(policy: AutoModelForCausalLM,
         for completion in request_output.outputs:
             generated_token_ids = torch.tensor(completion.token_ids, device=device)
 
-            # If the generated token ids are shorter than the maximum length, add EOS token and pad to max length (match behavior of generate())
+            # If the generated token ids are shorter than the maximum length, pad to max length (match behavior of generate())
             if generated_token_ids.shape[0] < generation_config.max_new_tokens:
-                generated_token_ids = torch.cat([generated_token_ids, torch.tensor([tokenizer.eos_token_id], device=device)])
-
-            if generated_token_ids.shape[0] < output_length:
                 padding = torch.full(
-                    (output_length - generated_token_ids.shape[0],),
+                    (generation_config.max_new_tokens - generated_token_ids.shape[0],),
                     tokenizer.pad_token_id,
                     dtype=torch.long,
                     device=device

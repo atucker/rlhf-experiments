@@ -104,7 +104,7 @@ class Args:
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 4 # number of samples to use for RLOO's baseline calculation
+    rloo_k: int = 2 # number of samples to use for RLOO's baseline calculation
     
     per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
