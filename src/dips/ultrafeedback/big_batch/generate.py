@@ -120,7 +120,7 @@ def generate_vllm(policy: AutoModelForCausalLM,
         tokenizer=tokenizer.name_or_path,
         max_model_len=output_length,
         tensor_parallel_size=args.world_size,
-        gpu_memory_utilization=0.7,
+        gpu_memory_utilization=0.65,
         trust_remote_code=True,
     )
     

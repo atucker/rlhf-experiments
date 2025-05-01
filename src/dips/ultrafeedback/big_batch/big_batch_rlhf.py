@@ -334,6 +334,8 @@ if __name__ == "__main__":
                     n_outputs_per_prompt = args.rloo_k,
                 )
                 model.to(device)
+                for param in model.parameters():
+                    param.requires_grad = True
                 del vllm_tokenizer
                 
             accelerator.wait_for_everyone()
@@ -415,6 +417,8 @@ if __name__ == "__main__":
             scores = torch.cat(scores, 0)
             logprobs = torch.cat(logprobs, 0)
             ref_logprobs = torch.cat(ref_logprobs, 0)
+
+            torch.cuda.empty_cache()
 
             # scale RM scores
             scores = scores * args.task.reward_coef
