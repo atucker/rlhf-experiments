@@ -133,7 +133,7 @@ def generate_vllm(policy: AutoModelForCausalLM,
         top_p=generation_config.top_p if generation_config.top_p < 1.0 else 1.0,
         top_k=generation_config.top_k if generation_config.top_k > 0 else -1, # VLLM uses -1 for no top_k
         max_tokens=generation_config.max_new_tokens,
-        min_tokens=generation_config.min_new_tokens, # VLLM might not support min_tokens
+        # min_tokens=generation_config.min_new_tokens, # VLLM might not support min_tokens
         stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id else None,
         skip_special_tokens=False, # Keep special tokens like EOS
         logprobs=None, # Not needed here; will compute later with `forward`
@@ -150,7 +150,20 @@ def generate_vllm(policy: AutoModelForCausalLM,
     for i, request_output in enumerate(vllm_outputs):
         for completion in request_output.outputs:
             generated_token_ids = torch.tensor(completion.token_ids, device=device)
-            assert generated_token_ids.shape[0] == generation_config.max_new_tokens
+
+            # If the generated token ids are shorter than the maximum length, add EOS token and pad to max length (match behavior of generate())
+            if generated_token_ids.shape[0] < generation_config.max_new_tokens:
+                generated_token_ids = torch.cat([generated_token_ids, torch.tensor([tokenizer.eos_token_id], device=device)])
+
+            if generated_token_ids.shape[0] < output_length:
+                padding = torch.full(
+                    (output_length - generated_token_ids.shape[0],),
+                    tokenizer.pad_token_id,
+                    dtype=torch.long,
+                    device=device
+                )
+                generated_token_ids = torch.cat([generated_token_ids, padding])
+
             all_output_sequences.append(generated_token_ids)
     
     if not all_output_sequences:

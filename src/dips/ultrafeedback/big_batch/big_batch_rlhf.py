@@ -289,15 +289,6 @@ if __name__ == "__main__":
                                             args = args,
                                             device = device,
                                             )
-            query_responses = []
-            responses = []
-            postprocessed_responses = []
-            logprobs = []
-            ref_logprobs = []
-            scores = []
-            reward_breakdowns = []
-            reward_breakdowns_coeffs = []
-            sequence_lengths = []
 
             # 1. Extract queries and reference responses from the dataset
             instruction = data["instruction"]
@@ -339,26 +330,32 @@ if __name__ == "__main__":
                     output_length = total_sequence_length,
                     device = device,
                     args = args,
-                    n_outputs_per_prompt = 1,
+                    n_outputs_per_prompt = args.rloo_k,
                 )
+            
+            accelerator.wait_for_everyone()
+            # Broadcast the generated responses from the main process to all other processes
+            response_tensor = accelerate.utils.broadcast(response_tensor, from_process=0)
+            accelerator.wait_for_everyone()
 
-                accelerator.wait_for_everyone()
-                # Broadcast the generated responses from the main process to all other processes
-                response_tensor = accelerate.utils.broadcast(response_tensor, from_process=0)
-                accelerator.wait_for_everyone()
+            # Truncate response after the first occurrence of `truncate_token_id`
+            if args.swap_eos_token:
+                postprocessed_response = truncate_response(args, chat_template_tokenizer, response_tensor)
+                logprob_mask = postprocessed_response == chat_template_tokenizer.eos_token_id
+            else:
+                postprocessed_response = truncate_response(args, tokenizer, response_tensor)
+                logprob_mask = postprocessed_response == tokenizer.pad_token_id
+            sequence_length = first_true_indices(logprob_mask) - 1
 
-                # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
-                if args.swap_eos_token:
-                    postprocessed_response = truncate_response(args, chat_template_tokenizer, response_tensor)
-                    logprob_mask = postprocessed_response == chat_template_tokenizer.eos_token_id
-                else:
-                    postprocessed_response = truncate_response(args, tokenizer, response_tensor)
-                    logprob_mask = postprocessed_response == tokenizer.pad_token_id
-                sequence_length = first_true_indices(logprob_mask) - 1
+            query_response_tensor = torch.cat([queries, response_tensor], dim = 1)
 
-                query_response_tensor = torch.cat([queries, response_tensor], dim = 1)
-
-                output = forward(accelerator.unwrap_model(model), query_response_tensor, tokenizer)
+            # 3. Calculate the logprobs and ref_logprobs for the given responses
+            logprobs = []
+            ref_logprobs = []
+            scores = []
+            for forward_pass_idx in range(0, len(query_response_tensor), args.per_device_rollout_batch_size):
+                query_response_batch = query_response_tensor[forward_pass_idx:forward_pass_idx + args.per_device_rollout_batch_size]
+                output = forward(accelerator.unwrap_model(model), query_response_batch, tokenizer)
                 if accelerator.is_main_process and accelerator.is_local_main_process and args.track:
                     wandb.config.update({"model/output_dtype": str(output.logits.dtype)})
 
@@ -367,7 +364,7 @@ if __name__ == "__main__":
                 # pad = torch.zeros(logits.shape[0], args.task.response_length-logits.shape[1], dtype = logits.dtype).to(device)
                 logits /= (args.task.temperature + args.eps)
                 all_logprob = F.log_softmax(logits, dim=-1)
-                logprob = torch.gather(all_logprob, 2, query_response_tensor.unsqueeze(-1)).squeeze(-1)
+                logprob = torch.gather(all_logprob, 2, query_response_batch.unsqueeze(-1)).squeeze(-1)
 
                 if args.calculate_kl_on_truncated_responses:
                     # Mask out padding tokens (we don't want to calculate KL divergence on them)
@@ -381,7 +378,7 @@ if __name__ == "__main__":
                 # ref_logits = torch.cat([ref_logits, pad], dim = 1)
                 ref_logits /= (args.task.temperature + args.eps)
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                ref_logprob = torch.gather(ref_all_logprob, 2, query_response_tensor.unsqueeze(-1)).squeeze(-1)
+                ref_logprob = torch.gather(ref_all_logprob, 2, query_response_batch.unsqueeze(-1)).squeeze(-1)
 
                 if args.calculate_kl_on_truncated_responses:
                     ref_logprob = torch.masked_fill(ref_logprob, logprob_mask, 0)
@@ -392,44 +389,31 @@ if __name__ == "__main__":
                 # repeated_instructions = []
                 # for inst in instruction_batch:
                 #     repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
-                truncated_query_response = torch.cat([query_response[:, :context_length], postprocessed_response], dim = 1)
                 score, reward_breakdown, reward_breakdown_coeffs = get_reward(reward_model = reward_model, 
-                                input_ids = truncated_query_response,
+                                input_ids = query_response_batch,
                                 tokenizer = tokenizer)
 
-                query_responses.append(query_response)
-                responses.append(response)
-                postprocessed_responses.append(postprocessed_response)
                 logprobs.append(logprob)
                 ref_logprobs.append(ref_logprob)
-                sequence_lengths.append(sequence_length)
                 scores.append(score)
-                reward_breakdowns.append(reward_breakdown)
-                reward_breakdowns_coeffs.append(reward_breakdown_coeffs)
 
-            query_responses = torch.cat(query_responses, 0)
-            responses = torch.cat(responses, 0)
-            postprocessed_responses = torch.cat(postprocessed_responses, 0)
+                torch.cuda.empty_cache()
+
+            scores = torch.cat(scores, 0)
             logprobs = torch.cat(logprobs, 0)
             ref_logprobs = torch.cat(ref_logprobs, 0)
-            sequence_lengths = torch.cat(sequence_lengths, 0)
-            scores = torch.cat(scores, 0)
-            reward_breakdowns = torch.cat(reward_breakdowns, 0)
-            reward_breakdowns_coeffs = torch.cat(reward_breakdowns_coeffs, 0)
-            del (logprob, ref_logprob, score)
-            torch.cuda.empty_cache()
 
             # scale RM scores
             scores = scores * args.task.reward_coef
-            assert scores.shape == torch.Size([query.shape[0] * args.rloo_k]), f"scores.shape {scores.shape} does not match query_responses.shape {query_responses.shape} * args.rloo_k {args.rloo_k}"
+            assert scores.shape == torch.Size([queries.shape[0] * args.rloo_k]), f"scores.shape {scores.shape} does not match queries.shape {queries.shape} * args.rloo_k {args.rloo_k}"
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id (doesn't exceed max len)
             # responses not passing that filter will receive a low (fixed) score
             # only query RM on responses that pass that filter
             if args.swap_eos_token:
-                contain_eos_token = torch.any(responses == chat_template_tokenizer.eos_token_id, dim=-1)
+                contain_eos_token = torch.any(response_tensor == chat_template_tokenizer.eos_token_id, dim=-1)
             else:
-                contain_eos_token = torch.any(responses == tokenizer.eos_token_id, dim=-1)
+                contain_eos_token = torch.any(response_tensor == tokenizer.eos_token_id, dim=-1)
             scores = torch.where(contain_eos_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
             penalty_frac = 1 - (contain_eos_token.sum() / len(contain_eos_token))
 
@@ -437,8 +421,8 @@ if __name__ == "__main__":
             if args.rloo_k > 1:
                 # The shape of score is [batch_size * rloo_k]
                 per_prompt_scores = scores.reshape(-1, args.rloo_k)
-                per_prompt_logprobs = torch.sum(logprobs, axis = 1).reshape(-1, args.rloo_k)
-                per_prompt_ref_logprobs = torch.sum(ref_logprobs, axis = 1).reshape(-1, args.rloo_k)
+                per_prompt_logprobs = torch.sum(logprob, axis = 1).reshape(-1, args.rloo_k)
+                per_prompt_ref_logprobs = torch.sum(ref_logprob, axis = 1).reshape(-1, args.rloo_k)
                 per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
                 kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
                 score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
@@ -448,16 +432,16 @@ if __name__ == "__main__":
                 baselines = torch.zeros_like(scores)
 
             # 4. compute rewards
-            kl = logprobs - ref_logprobs # [batch_size, response_len]
+            kl = logprob - ref_logprob # [batch_size, response_len]
             non_score_reward = -kl_ctl.value * kl
             rewards = non_score_reward.clone()
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
-            actual_end = sequence_lengths
+            actual_end = sequence_length
             rewards[[actual_start, actual_end]] += scores
-            writer.add_scalar("generation/seq_len_mean", sequence_lengths.to(torch.float32).mean().item(), update)
-            writer.add_scalar("generation/seq_len_std", sequence_lengths.to(torch.float32).std().item(), update)
-            writer.add_scalar("generation/seq_len_max", sequence_lengths.max().item(), update)
-            writer.add_scalar("generation/seq_len_min", sequence_lengths.min().item(), update)
+            writer.add_scalar("generation/seq_len_mean", sequence_length.to(torch.float32).mean().item(), update)
+            writer.add_scalar("generation/seq_len_std", sequence_length.to(torch.float32).std().item(), update)
+            writer.add_scalar("generation/seq_len_max", sequence_length.max().item(), update)
+            writer.add_scalar("generation/seq_len_min", sequence_length.min().item(), update)
 
             # Log reward breakdowns to wandb
             reward_breakdown_dict, reward_breakdown_coeffs_dict = parse_reward_breakdown_attributes(reward_breakdown = reward_breakdown, 
@@ -475,7 +459,7 @@ if __name__ == "__main__":
 
         stats_shape = (args.ppo.noptepochs)
         metrics = defaultdict(lambda: torch.zeros(stats_shape, device = device))
-        num_samples = len(query_responses)
+        num_samples = len(query_response_tensor)
         num_minibatches = num_samples // args.per_device_train_batch_size
 
         if args.use_chat_template:
@@ -490,11 +474,11 @@ if __name__ == "__main__":
                 mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
                 with accelerator.accumulate(model):
                     # These are all fixed and won't get gradients
-                    mb_responses = responses[mini_batch_inds] # [batch_size, response_len]
-                    mb_query_responses = query_responses[mini_batch_inds] # [batch_size, seq_len]
-                    mb_postprocessed_responses = postprocessed_responses[mini_batch_inds] # [batch_size, response_len]
-                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1) # [batch_size]
-                    mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
+                    mb_responses = response_tensor[mini_batch_inds] # [batch_size, response_len]
+                    mb_query_responses = query_response_tensor[mini_batch_inds] # [batch_size, seq_len]
+                    mb_postprocessed_responses = postprocessed_response[mini_batch_inds] # [batch_size, response_len]
+                    mb_logprobs = torch.sum(logprob[mini_batch_inds], axis=1) # [batch_size]
+                    mb_ref_logprobs = torch.sum(ref_logprob[mini_batch_inds], axis=1)
                     mb_reward = scores[mini_batch_inds]
                     mb_baseline = baselines[mini_batch_inds]
 

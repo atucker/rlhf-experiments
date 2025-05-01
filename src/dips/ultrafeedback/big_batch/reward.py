@@ -7,7 +7,7 @@ def get_reward(reward_model: nn.Module,
                tokenizer: AutoTokenizer,
                ):
     """
-    Uses the reward model to calculate reward information for the given query_responses.
+    Uses the reward model to calculate reward information for the given query_responses. Ignores padding.
 
     Returns a scalar reward for each query_response pair.
     Expected input shape: [batch_size, seq_len] (should include both prompt and response, inc. chat template)
