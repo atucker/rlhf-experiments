@@ -354,13 +354,14 @@ if __name__ == "__main__":
             logprobs = []
             ref_logprobs = []
             scores = []
-            for forward_pass_idx in range(0, len(query_response_tensor), args.local_rollout_forward_batch_size):
-                start_idx = forward_pass_idx * args.local_rollout_forward_batch_size
+            for start_idx in range(0, len(query_response_tensor), args.local_rollout_forward_batch_size):
                 end_idx = min(start_idx + args.local_rollout_forward_batch_size, len(query_response_tensor))
                 query_response_batch = query_response_tensor[start_idx:end_idx]
                 logprob_mask_batch = logprob_mask[start_idx:end_idx]
 
                 response_batch = query_response_batch[:, context_length:]
+                response_batch = torch.masked_fill(response_batch, logprob_mask_batch, 0)
+
                 output = forward(model = accelerator.unwrap_model(model), 
                                  input_ids = query_response_batch, 
                                  tokenizer = tokenizer,
@@ -373,9 +374,8 @@ if __name__ == "__main__":
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response_batch.unsqueeze(-1)).squeeze(-1)
 
-                if args.calculate_kl_on_truncated_responses:
-                    # Mask out padding tokens (we don't want to calculate KL divergence on them)
-                    logprob = torch.masked_fill(logprob, logprob_mask_batch, 0)
+                # Mask out padding tokens (we don't want to calculate KL divergence on them)
+                logprob = torch.masked_fill(logprob, logprob_mask_batch, 0)
                 del output, logits, all_logprob
 
                 ref_output = forward(model = accelerator.unwrap_model(model), 
@@ -391,8 +391,7 @@ if __name__ == "__main__":
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
                 ref_logprob = torch.gather(ref_all_logprob, 2, response_batch.unsqueeze(-1)).squeeze(-1)
 
-                if args.calculate_kl_on_truncated_responses:
-                    ref_logprob = torch.masked_fill(ref_logprob, logprob_mask_batch, 0)
+                ref_logprob = torch.masked_fill(ref_logprob, logprob_mask_batch, 0)
                 del ref_output, ref_logits, ref_all_logprob
                 torch.cuda.empty_cache()
 
@@ -507,12 +506,12 @@ if __name__ == "__main__":
                     # index logprobs over vocab dim by what the model actually generated
                     new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                     # shape [batch_size] (total logprob of the response)
-                    if args.calculate_kl_on_truncated_responses:
-                        if args.swap_eos_token:
-                            logprob_mask = mb_postprocessed_responses == chat_template_tokenizer.eos_token_id
-                        else:
-                            logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
-                        new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
+
+                    if args.swap_eos_token:
+                        logprob_mask = mb_postprocessed_responses == chat_template_tokenizer.eos_token_id
+                    else:
+                        logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
+                    new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
                     new_logprobs = torch.sum(new_logprobs, axis=1)
                     with torch.amp.autocast(device_type = "cuda",
                                             enabled = not args.loss_full_precision):

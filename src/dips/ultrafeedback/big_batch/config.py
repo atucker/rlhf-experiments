@@ -54,7 +54,7 @@ class Args:
     loss_full_precision: bool = False
     unembed_full_precision: bool = False
     use_chat_template: bool = True
-    calculate_kl_on_truncated_responses: bool = True # recommended: False. See discussion in #rlhf.
+    calculate_kl_on_truncated_responses: bool = True # MUST BE TRUE for big-batch RLHF.
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
     kl_grad_patch: bool = False # use RLOO with the KL gradient term patched in. Should be theoretically equivalent to DIPS.
