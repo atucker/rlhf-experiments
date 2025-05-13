@@ -102,7 +102,7 @@ class Args:
     loss_full_precision: bool = False
     unembed_full_precision: bool = False
     use_chat_template: bool = True
-    calculate_kl_on_truncated_responses: bool = True # recommended: False. See discussion in #rlhf.
+    calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
     clip_grad_norm: Optional[float] = None
     force_clear_grad_optim: bool = True # an optimization to reduce GPU memory usage. May mess with gradient clipping.
     kl_grad_patch: bool = False # use RLOO with the KL gradient term patched in. Should be theoretically equivalent to DIPS.
@@ -136,7 +136,7 @@ class Args:
     # optimizer args
     eps: float = 1e-5
     """the epsilon value for the optimizer - an extremely small value to prevent division by zero"""
-    lr: float = 1e-4
+    lr: float = 2e-5
     """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
