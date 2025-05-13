@@ -99,8 +99,8 @@ class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
     factor_loss: bool = False
     debug_tensor_info: bool = False
-    loss_full_precision: bool = False
-    unembed_full_precision: bool = False
+    loss_full_precision: bool = True
+    unembed_full_precision: bool = True
     use_chat_template: bool = True
     calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
     clip_grad_norm: Optional[float] = None
@@ -112,7 +112,7 @@ class Args:
     """the name of this experiment"""
     seed: int = 55134
     """seed of the experiment"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "llama_3_8b_ultrafeedback"
     """the wandb's project name"""
@@ -152,16 +152,16 @@ class Args:
     """The number of gradient accumulation steps"""
 
     # ------ Batch Size in Memory / GPU: per_device_train_batch_size --------
-    rloo_k: int = 4 # number of samples to use for RLOO's baseline calculation
+    rloo_k: int = 2 # number of samples to use for RLOO's baseline calculation
     
     per_device_train_batch_size: int = 2
     """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
-    per_device_eval_batch_size: int = 4
+    per_device_eval_batch_size: int = 8
     """per rank eval batch size"""
-    local_rollout_forward_batch_size: int = 4
+    local_rollout_forward_batch_size: int = 8
     """per rank no grad forward pass in the rollout phase. Note that this is multiplied by rloo_k - we have 8 novel prompts and generate 4 responses for each."""
 
-    total_episodes: int = int(6416) # Informs the number of ppo updates to do
+    total_episodes: int = int(6416*2) # Informs the number of ppo updates to do
     """The total number of episodes in the dataset"""
 
     # optional args filled while running
