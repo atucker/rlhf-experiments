@@ -26,7 +26,7 @@ def initialize_policy_with_optimizer(args: Args,
         policy = PrecisionModel.from_pretrained(args.sft_model_path,
                                                 config=model_config,
                                                 trust_remote_code=True,
-                                                low_cpu_mem_usage = True)
+                                                low_cpu_mem_usage = True) 
     else:
         policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
                                                     config=model_config, 

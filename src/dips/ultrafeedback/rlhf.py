@@ -112,7 +112,7 @@ class Args:
     """the name of this experiment"""
     seed: int = 55134
     """seed of the experiment"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "llama_3_8b_ultrafeedback"
     """the wandb's project name"""

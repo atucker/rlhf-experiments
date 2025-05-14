@@ -28,7 +28,7 @@ def forward(model: AutoModelForCausalLM,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_dict=True,
-                output_hidden_states=True,
+                output_hidden_states=False,
             )
     else:
         return model(

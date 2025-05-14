@@ -164,6 +164,8 @@ if __name__ == "__main__":
         pprint(reward_model.config)
 
     policy, optimizer, scheduler = initialize_policy_with_optimizer(args, model_config, accelerator, grad_norm_logger)
+    # policy.config.use_cache = False
+    # policy.gradient_checkpointing_enable()
 
     # ========= Data =========
     dataloader, validation_dataloader = get_dataloaders(args, tokenizer)
@@ -495,8 +497,8 @@ if __name__ == "__main__":
                     mb_responses = response_tensor[mini_batch_inds] # [batch_size, response_len]
                     mb_query_responses = query_response_tensor[mini_batch_inds] # [batch_size, seq_len]
                     mb_postprocessed_responses = postprocessed_response[mini_batch_inds] # [batch_size, response_len]
-                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1) # [batch_size]
-                    mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1)
+                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1).detach() # [batch_size]
+                    mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1).detach()
                     mb_reward = scores[mini_batch_inds]
                     mb_baseline = baselines[mini_batch_inds]
 
