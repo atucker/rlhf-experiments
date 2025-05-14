@@ -275,11 +275,22 @@ def get_reward(reward_model: nn.Module,
 
 class PrecisionModel(AutoModelForCausalLM):
     def forward(self, *args, **kwargs):
-        before_unembed = super().forward(*args, **kwargs, output_hidden_states = True).hidden_states[-1]
+        original_output_hidden_states = kwargs.pop('output_hidden_states', False)
+        outputs = super().forward(*args, **kwargs, output_hidden_states=True)
+        
+        before_unembed = outputs.hidden_states[-1]
         with torch.amp.autocast(device_type = "cuda", enabled = False):
             before_unembed = before_unembed.to(torch.float32)
-            logits = self.lm_head(before_unembed)
-        return logits
+            new_logits = self.lm_head(before_unembed)
+
+        # Replace the logits in the original outputs object
+        outputs.logits = new_logits
+
+        # If the original call didn't want hidden states, don't return them
+        if not original_output_hidden_states and hasattr(outputs, 'hidden_states'):
+            outputs.hidden_states = None
+            
+        return outputs
     
 def swap_eos_token(sequences: torch.Tensor, from_token: str = "<|eot_id|>", 
                    to_token: str = "<|end_of_text|>") -> torch.Tensor:
