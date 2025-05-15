@@ -99,8 +99,8 @@ class Args:
     train_dips: bool = False # whether to train via DIPS or RLOO
     factor_loss: bool = False
     debug_tensor_info: bool = False
-    loss_full_precision: bool = True
-    unembed_full_precision: bool = True
+    loss_full_precision: bool = False
+    unembed_full_precision: bool = False
     use_chat_template: bool = True
     calculate_kl_on_truncated_responses: bool = False # recommended: False. See discussion in #rlhf.
     clip_grad_norm: Optional[float] = None
