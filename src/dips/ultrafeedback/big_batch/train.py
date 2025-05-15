@@ -57,20 +57,20 @@ if __name__ == "__main__":
     parser.add_argument("--postprocessed_response_file", type=str, default=None)
     parsed_args = parser.parse_args()
     with open(parsed_args.query_response_tensor_file, "rb") as f:
-        query_response_tensor = pkl.load(f)
+        query_response_tensor = torch.load(f)
     with open(parsed_args.response_tensor_file, "rb") as f:
-        response_tensor = pkl.load(f)
+        response_tensor = torch.load(f)
     with open(parsed_args.logprob_mask_file, "rb") as f:
-        logprob_mask = pkl.load(f)
+        logprob_mask = torch.load(f)
     context_length = int(parsed_args.context_length)
     with open(parsed_args.queries_file, "rb") as f:
-        queries = pkl.load(f)
+        queries = torch.load(f)
     with open(parsed_args.sequence_length_file, "rb") as f:
-        sequence_length = pkl.load(f)
+        sequence_length = torch.load(f)
     with open(parsed_args.args_file, "rb") as f:
         args = pkl.load(f)
     with open(parsed_args.postprocessed_response_file, "rb") as f:
-        postprocessed_response = pkl.load(f)
+        postprocessed_response = torch.load(f)
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps) 
 

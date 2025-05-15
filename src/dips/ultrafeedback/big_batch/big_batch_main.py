@@ -232,7 +232,8 @@ if __name__ == "__main__":
                                         "--save_dir", os.path.join(LORA_DIR, "output"),
                                         "--args_file", os.path.join(LORA_DIR, "args.pkl"),
                                         "--prompts_file", os.path.join(LORA_DIR, "prompts.pkl"),
-                                        "--generation_config_file", os.path.join(LORA_DIR, "generation_config.pkl")
+                                        "--generation_config_file", os.path.join(LORA_DIR, "generation_config.pkl"),
+                                        "--n_outputs_per_prompt", str(args.rloo_k)
                                         ])
             process.wait()
             response_tensor = torch.load(os.path.join(LORA_DIR, "output", "responses.pkl")).to(device)

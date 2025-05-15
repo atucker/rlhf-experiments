@@ -206,6 +206,7 @@ if __name__ == "__main__":
     parser.add_argument("--args_file", type=str, default=None)
     parser.add_argument("--prompts_file", type=str, default=None)
     parser.add_argument("--generation_config_file", type=str, default=None)
+    parser.add_argument("--n_outputs_per_prompt", type=int, default=1)
 
     parsed_args = parser.parse_args()
     with open(parsed_args.args_file, "rb") as f:
@@ -226,4 +227,5 @@ if __name__ == "__main__":
                   output_length = int(parsed_args.output_length),
                   device = parsed_args.device,
                   args = args, 
-                  save_dir = parsed_args.save_dir)
+                  save_dir = parsed_args.save_dir,
+                  n_outputs_per_prompt = int(parsed_args.n_outputs_per_prompt))
