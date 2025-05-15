@@ -25,67 +25,58 @@ from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    GenerationConfig,
     PreTrainedModel,
 )
-import warnings
 
 # Package imports
 from dips.tldr.utils import set_seed
-from dips.ultrafeedback.big_batch.config import Args
 from dips.ultrafeedback.big_batch.tokenization_utils import maybe_use_chat_template
-from dips.ultrafeedback.big_batch.eval import evaluate
 from dips.ultrafeedback.big_batch.misc import AdaptiveKLController
 from dips.ultrafeedback.big_batch.logging_utils import GradNormLogger, print_rich_table, parse_reward_breakdown_attributes
 from dips.ultrafeedback.big_batch.tensor_ops import configure_dropout, truncate_response, first_true_indices, debug_tensor_info, force_clear_grads
 from dips.ultrafeedback.big_batch.model import initialize_policy_with_optimizer
-from dips.ultrafeedback.big_batch.data import get_dataloaders
 from dips.ultrafeedback.big_batch.generate import forward
 from dips.ultrafeedback.big_batch.reward import get_reward
 import argparse
+import pickle as pkl
 
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
 if __name__ == "__main__":
 
     # ========= Setup =========
-    args = tyro.cli(Args)
     parser = argparse.ArgumentParser()
     parser.add_argument("--lora_dir", type=str, default=None)
+    parser.add_argument("--query_response_tensor_file", type=str, default=None)
+    parser.add_argument("--response_tensor_file", type=str, default=None)
+    parser.add_argument("--logprob_mask_file", type=str, default=None)
+    parser.add_argument("--context_length", type=int, default=None)
+    parser.add_argument("--queries_file", type=str, default=None)
+    parser.add_argument("--sequence_length_file", type=str, default=None)
+    parser.add_argument("--args_file", type=str, default=None)
+    parser.add_argument("--postprocessed_response_file", type=str, default=None)
     parsed_args = parser.parse_args()
-    args.lora_dir = parsed_args.lora_dir
+    with open(parsed_args.query_response_tensor_file, "rb") as f:
+        query_response_tensor = pkl.load(f)
+    with open(parsed_args.response_tensor_file, "rb") as f:
+        response_tensor = pkl.load(f)
+    with open(parsed_args.logprob_mask_file, "rb") as f:
+        logprob_mask = pkl.load(f)
+    context_length = int(parsed_args.context_length)
+    with open(parsed_args.queries_file, "rb") as f:
+        queries = pkl.load(f)
+    with open(parsed_args.sequence_length_file, "rb") as f:
+        sequence_length = pkl.load(f)
+    with open(parsed_args.args_file, "rb") as f:
+        args = pkl.load(f)
+    with open(parsed_args.postprocessed_response_file, "rb") as f:
+        postprocessed_response = pkl.load(f)
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps) 
 
     local_seed = args.seed + accelerator.process_index * 100003  # Prime
     set_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-
-    args.world_size = accelerator.num_processes
-    args.batch_size = args.per_device_train_batch_size * args.world_size
-
-    if ("instruct" in args.base_model.lower()) and (not args.use_chat_template):
-        warnings.warn("You are using an instruct model without chat template. This may lead to unexpected results.")
-    
-    if ("instruct" not in args.base_model.lower()):
-        assert args.swap_eos_token, "Make sure to swap the eos token when using a non-instruct model!"
-        if args.use_chat_template:
-            warnings.warn("You are using a non-instruct model with chat template. This may lead to unexpected results; the tokenization scheme between the instruct model and the base model may be different.")
-
-    if args.kl_grad_patch:
-        assert not args.train_dips, "KL grad patch is only supported for RLOO training"
-
-    train_is_multi_batch = args.per_device_train_batch_size != 1
-    eval_is_multi_batch = (args.rloo_k * args.local_rollout_forward_batch_size) != 1
-    
-    if args.train_dips:
-        if train_is_multi_batch != eval_is_multi_batch:
-            warnings.warn("""One of your training or evaluation batch sizes is 1 while the other is not.
-        It's a known issue that huggingface models generate slightly different logits depending on batch size. While this difference is slight,
-        it completely breaks the probability weighting ratio for DIPS. For Llama-8b, all batch sizes != 1 have identical behavior.
-        """)
-
-    args.ppo.num_updates = args.total_episodes // args.batch_size
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
@@ -170,19 +161,19 @@ if __name__ == "__main__":
                                                                     model_config, 
                                                                     grad_norm_logger,
                                                                     load_from_checkpoint = args.load_from_checkpoint,
-                                                                    lora_dir = args.lora_dir)
+                                                                    lora_dir = parsed_args.lora_dir)
     # policy.config.use_cache = False
     # policy.gradient_checkpointing_enable()
 
     # ========= Data =========
     reward_model = reward_model.to(device)
     kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
-
+    model, optimizer, scheduler = accelerator.prepare(policy, optimizer, scheduler)
     # ========= Main Training Loop =========
     global_step = 0
     start_time = time.time()
 
-    policy.train()
+    model.train()
     for update in trange(1, args.ppo.num_updates + 1):
         global_step += 1 * args.batch_size
         frac = 1.0 - ((update - 1.0) / args.ppo.num_updates)
@@ -436,7 +427,6 @@ if __name__ == "__main__":
                 "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
             )
             writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
-            writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
 
             writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
@@ -458,22 +448,6 @@ if __name__ == "__main__":
             if args.force_clear_grad_optim:
                 if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
                     force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
-
-    if args.run_eval:
-        eval_storage, eval_df = evaluate(
-            args,
-            reward_model,
-            accelerator.unwrap_model(model),
-            tokenizer,
-            validation_dataloader,
-            validation_generation_config,
-            sampling=False,
-            max_eval_size = args.max_eval_size,
-        )
-        if accelerator.is_main_process:
-            eval_df.to_csv(f"runs/{run_name}/table.csv")
-            if args.track:
-                wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
 
     # save model
     if args.output_dir:
