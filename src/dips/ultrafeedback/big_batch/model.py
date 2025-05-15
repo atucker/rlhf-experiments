@@ -6,6 +6,7 @@ from dips.ultrafeedback.big_batch.config import Args
 from peft import get_peft_model, LoraConfig
 from dips.ultrafeedback.big_batch.logging_utils import GradNormLogger
 from transformers import get_scheduler
+from peft import PeftModel
 
 class PrecisionModel(AutoModelForCausalLM):
     def forward(self, *args, **kwargs):
@@ -17,39 +18,45 @@ class PrecisionModel(AutoModelForCausalLM):
     
 def initialize_policy_with_optimizer(args: Args,
                                     model_config: AutoConfig,
-                                    accelerator: Accelerator,
-                                    grad_norm_logger: GradNormLogger):
+                                    grad_norm_logger: GradNormLogger,
+                                    lora_dir: str = None,
+                                    load_from_checkpoint: bool = False):
     """
     Returns: policy, optimizer, scheduler.
     """
-    if args.unembed_full_precision:
-        policy = PrecisionModel.from_pretrained(args.sft_model_path,
-                                                config=model_config,
-                                                trust_remote_code=True,
-                                                low_cpu_mem_usage = True) 
+
+    if load_from_checkpoint:
+        policy = PeftModel.from_pretrained(args.sft_model_path, lora_dir)
     else:
-        policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
-                                                    config=model_config, 
+        if args.unembed_full_precision:
+            policy = PrecisionModel.from_pretrained(args.sft_model_path,
+                                                    config=model_config,
                                                     trust_remote_code=True,
-                                                    torch_dtype="auto",
-                                                    low_cpu_mem_usage = True)
+                                                    low_cpu_mem_usage = True) 
+        else:
+            policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
+                                                        config=model_config, 
+                                                        trust_remote_code=True,
+                                                        torch_dtype="auto",
+                                                        low_cpu_mem_usage = True)
+       
     
     # Freeze the policy model base weights
     for param in policy.parameters():
         param.requires_grad = False
 
-    peft_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
+    if not load_from_checkpoint:
+        peft_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+        )
 
-    policy = get_peft_model(policy, peft_config=peft_config)
+        policy = get_peft_model(policy, peft_config=peft_config)
     param_subset = [param for param in policy.parameters() if param.requires_grad]
     grad_norm_logger.setup(param_subset)
 
-    accelerator.print(policy)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     

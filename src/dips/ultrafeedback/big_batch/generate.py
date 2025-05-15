@@ -6,6 +6,10 @@ from vllm import LLM, SamplingParams
 from typing import List
 from accelerate import Accelerator
 import gc
+import argparse
+from peft import PeftModel
+import pickle as pkl
+import os
 
 def forward(model: AutoModelForCausalLM, 
             input_ids: torch.Tensor, 
@@ -79,7 +83,6 @@ def generate(lm_backbone: AutoModelForCausalLM,
     return full_sequences
 
 def generate_vllm(policy: AutoModelForCausalLM,
-                  accelerator: Accelerator,
                   prompts: List[str],
                   tokenizer: AutoTokenizer, # Tokenizer used for prompts & padding
                   generation_config: GenerationConfig,
@@ -88,6 +91,7 @@ def generate_vllm(policy: AutoModelForCausalLM,
                   device: torch.device,
                   args: Args,
                   n_outputs_per_prompt: int = 1,
+                  save_dir: str = None
                  ) -> torch.Tensor:
     """
     Generates sequences using VLLM engine.
@@ -108,7 +112,7 @@ def generate_vllm(policy: AutoModelForCausalLM,
     """
 
     # TODO: This is a hack to get the policy model to work with VLLM.
-    policy_lora_merged = accelerator.unwrap_model(policy).merge_and_unload()
+    policy_lora_merged = policy.merge_and_unload()
     policy_lora_merged.save_pretrained(f"{args.output_dir}/temp_lora_merged")
 
     del policy_lora_merged
@@ -179,5 +183,47 @@ def generate_vllm(policy: AutoModelForCausalLM,
     del prompt_token_ids
     gc.collect()
     torch.cuda.empty_cache()
+
+    if save_dir:
+        # Create the save directory if it doesn't exist
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(final_tensor, os.path.join(save_dir, "responses.pkl"))
+
+    # Explicitly destroy the process group if it was initialized
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
     
     return final_tensor
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
+    parser.add_argument("--lora_dir", type=str, default="models/temp_lora")
+    parser.add_argument("--output_length", type=int, default=1024)
+    parser.add_argument("--context_length", type=int, default=1024)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--args_file", type=str, default=None)
+    parser.add_argument("--prompts_file", type=str, default=None)
+    parser.add_argument("--generation_config_file", type=str, default=None)
+
+    parsed_args = parser.parse_args()
+    with open(parsed_args.args_file, "rb") as f:
+        args = pkl.load(f)
+    with open(parsed_args.prompts_file, "rb") as f:
+        prompts = pkl.load(f)
+    with open(parsed_args.generation_config_file, "rb") as f:
+        generation_config = pkl.load(f)
+    tokenizer = AutoTokenizer.from_pretrained(parsed_args.lora_dir)
+    base_model = AutoModelForCausalLM.from_pretrained(parsed_args.base_model)
+    policy = PeftModel.from_pretrained(base_model, parsed_args.lora_dir)
+    print(f"Saving in {parsed_args.save_dir}")
+    generate_vllm(policy = policy, 
+                  prompts = prompts,
+                  tokenizer = tokenizer, 
+                  generation_config = generation_config,
+                  context_length = int(parsed_args.context_length),
+                  output_length = int(parsed_args.output_length),
+                  device = parsed_args.device,
+                  args = args, 
+                  save_dir = parsed_args.save_dir)
