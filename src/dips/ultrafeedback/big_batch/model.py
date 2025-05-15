@@ -25,35 +25,34 @@ def initialize_policy_with_optimizer(args: Args,
     Returns: policy, optimizer, scheduler.
     """
 
-    if load_from_checkpoint:
-        policy = PeftModel.from_pretrained(args.sft_model_path, lora_dir)
+    if args.unembed_full_precision:
+        policy = PrecisionModel.from_pretrained(args.sft_model_path,
+                                                config=model_config,
+                                                trust_remote_code=True) 
     else:
-        if args.unembed_full_precision:
-            policy = PrecisionModel.from_pretrained(args.sft_model_path,
-                                                    config=model_config,
+        policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
+                                                    config=model_config, 
                                                     trust_remote_code=True,
-                                                    low_cpu_mem_usage = True) 
-        else:
-            policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, 
-                                                        config=model_config, 
-                                                        trust_remote_code=True,
-                                                        torch_dtype="auto",
-                                                        low_cpu_mem_usage = True)
-       
-    
+                                                    torch_dtype="auto") 
+
     # Freeze the policy model base weights
     for param in policy.parameters():
         param.requires_grad = False
 
-    if not load_from_checkpoint:
-        peft_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-        )
-
+    peft_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+    )
+    if load_from_checkpoint:
+        policy = PeftModel.from_pretrained(policy, 
+                                           lora_dir, 
+                                           config = peft_config,
+                                           is_trainable = True)
+    else:
         policy = get_peft_model(policy, peft_config=peft_config)
+
     param_subset = [param for param in policy.parameters() if param.requires_grad]
     grad_norm_logger.setup(param_subset)
 
@@ -61,9 +60,11 @@ def initialize_policy_with_optimizer(args: Args,
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     
     if args.optimizer == "adam":
-        optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=args.eps)
+        optimizer = optim.Adam(param_subset, lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
+        optimizer = optim.AdamW(param_subset, lr=args.lr, eps=args.eps)
+
+    print("Params being optimized:", [name for name, param in policy.named_parameters() if param.requires_grad])
 
     scheduler = get_scheduler(
         args.scheduler,

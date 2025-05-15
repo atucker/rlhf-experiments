@@ -170,9 +170,10 @@ if __name__ == "__main__":
     # ========= Data =========
     reward_model = reward_model.to(device)
     kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
+    if accelerator.state.deepspeed_plugin is not None:
+        accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = args.per_device_train_batch_size
     model, optimizer, scheduler = accelerator.prepare(policy, optimizer, scheduler)
     # ========= Main Training Loop =========
-    global_step = 0
     start_time = time.time()
 
     model.train()
@@ -330,8 +331,10 @@ if __name__ == "__main__":
                                      input_ids = mb_query_responses.clone().detach(), 
                                      tokenizer = tokenizer,
                                      args = args)
+                    print("Output:", output)
                     # output.logits has shape [batch_size, seq_len, vocab_size]
                     logits = output.logits[:, context_length - 1 : -1] # logits of response [batch_size, response_len, vocab_size]
+                    print("Logits:", logits.requires_grad, logits.grad_fn)
                     # pad = torch.ones(logits.shape[0], args.task.response_length-logits.shape[1], logits.shape[2], dtype = logits.dtype).to(device)
                     # logits = torch.cat([logits, pad], dim = 1)
                     logits /= (args.task.temperature + args.eps)
@@ -347,6 +350,7 @@ if __name__ == "__main__":
                     # shape [batch_size] (total logprob of the response)
                     new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
                     new_logprobs = torch.sum(new_logprobs, axis=1)
+                    print("New logprobs:", new_logprobs.requires_grad, new_logprobs.grad_fn)
                     with torch.amp.autocast(device_type = "cuda",
                                             enabled = not args.loss_full_precision):
                         if args.train_dips:
