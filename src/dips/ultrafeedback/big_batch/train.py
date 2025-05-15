@@ -55,6 +55,7 @@ if __name__ == "__main__":
     parser.add_argument("--sequence_length_file", type=str, default=None)
     parser.add_argument("--args_file", type=str, default=None)
     parser.add_argument("--postprocessed_response_file", type=str, default=None)
+    parser.add_argument("--update_num", type=int, default=None)
     parsed_args = parser.parse_args()
     with open(parsed_args.query_response_tensor_file, "rb") as f:
         query_response_tensor = torch.load(f)
@@ -71,6 +72,7 @@ if __name__ == "__main__":
         args = pkl.load(f)
     with open(parsed_args.postprocessed_response_file, "rb") as f:
         postprocessed_response = torch.load(f)
+    update = int(parsed_args.update_num)
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps) 
 
@@ -160,7 +162,7 @@ if __name__ == "__main__":
     policy, optimizer, scheduler = initialize_policy_with_optimizer(args, 
                                                                     model_config, 
                                                                     grad_norm_logger,
-                                                                    load_from_checkpoint = args.load_from_checkpoint,
+                                                                    load_from_checkpoint = True,
                                                                     lora_dir = parsed_args.lora_dir)
     # policy.config.use_cache = False
     # policy.gradient_checkpointing_enable()
@@ -174,127 +176,123 @@ if __name__ == "__main__":
     start_time = time.time()
 
     model.train()
-    for update in trange(1, args.ppo.num_updates + 1):
-        global_step += 1 * args.batch_size
-        frac = 1.0 - ((update - 1.0) / args.ppo.num_updates)
-        lrnow = frac * args.lr # linear learning rate decay
-        optimizer.param_groups[0]["lr"] = lrnow
-        with torch.no_grad():
-            # 3. Calculate the logprobs and ref_logprobs for the given responses
-            logprobs = []
-            ref_logprobs = []
-            scores = []
-            for start_idx in range(0, len(query_response_tensor), args.local_rollout_forward_batch_size):
-                end_idx = min(start_idx + args.local_rollout_forward_batch_size, len(query_response_tensor))
-                query_response_batch = query_response_tensor[start_idx:end_idx]
-                logprob_mask_batch = logprob_mask[start_idx:end_idx]
 
-                response_batch = query_response_batch[:, context_length:]
-                response_batch = torch.masked_fill(response_batch, logprob_mask_batch, 0)
+    with torch.no_grad():
+        # 3. Calculate the logprobs and ref_logprobs for the given responses
+        logprobs = []
+        ref_logprobs = []
+        scores = []
+        for start_idx in range(0, len(query_response_tensor), args.local_rollout_forward_batch_size):
+            end_idx = min(start_idx + args.local_rollout_forward_batch_size, len(query_response_tensor))
+            query_response_batch = query_response_tensor[start_idx:end_idx]
+            logprob_mask_batch = logprob_mask[start_idx:end_idx]
 
-                output = forward(model = accelerator.unwrap_model(model), 
-                                 input_ids = query_response_batch, 
-                                 tokenizer = tokenizer,
-                                 args = args)
-                if accelerator.is_main_process and accelerator.is_local_main_process and args.track:
-                    wandb.config.update({"model/output_dtype": str(output.logits.dtype)})
+            response_batch = query_response_batch[:, context_length:]
+            response_batch = torch.masked_fill(response_batch, logprob_mask_batch, 0)
 
-                logits = output.logits[:, context_length - 1 : -1]
-                logits /= (args.task.temperature + args.eps)
-                all_logprob = F.log_softmax(logits, dim=-1)
-                logprob = torch.gather(all_logprob, 2, response_batch.unsqueeze(-1)).squeeze(-1)
+            output = forward(model = accelerator.unwrap_model(model), 
+                                input_ids = query_response_batch, 
+                                tokenizer = tokenizer,
+                                args = args)
+            if accelerator.is_main_process and accelerator.is_local_main_process and args.track:
+                wandb.config.update({"model/output_dtype": str(output.logits.dtype)})
 
-                # Mask out padding tokens (we don't want to calculate KL divergence on them)
-                logprob = torch.masked_fill(logprob, logprob_mask_batch, 0)
-                del output, logits, all_logprob
+            logits = output.logits[:, context_length - 1 : -1]
+            logits /= (args.task.temperature + args.eps)
+            all_logprob = F.log_softmax(logits, dim=-1)
+            logprob = torch.gather(all_logprob, 2, response_batch.unsqueeze(-1)).squeeze(-1)
 
-                ref_output = forward(model = accelerator.unwrap_model(model), 
-                                     input_ids = query_response_batch, 
-                                     tokenizer = tokenizer,
-                                     args = args,
-                                     ref = True)
-                ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                # Pad output sequence to response_length (necessary to avoid shape mismatch across devices)
-                # pad = torch.ones(ref_logits.shape[0], args.task.response_length-ref_logits.shape[1], dtype = ref_logits.dtype).to(device)
-                # ref_logits = torch.cat([ref_logits, pad], dim = 1)
-                ref_logits /= (args.task.temperature + args.eps)
-                ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                ref_logprob = torch.gather(ref_all_logprob, 2, response_batch.unsqueeze(-1)).squeeze(-1)
+            # Mask out padding tokens (we don't want to calculate KL divergence on them)
+            logprob = torch.masked_fill(logprob, logprob_mask_batch, 0)
+            del output, logits, all_logprob
 
-                ref_logprob = torch.masked_fill(ref_logprob, logprob_mask_batch, 0)
-                del ref_output, ref_logits, ref_all_logprob
-                torch.cuda.empty_cache()
+            ref_output = forward(model = accelerator.unwrap_model(model), 
+                                    input_ids = query_response_batch, 
+                                    tokenizer = tokenizer,
+                                    args = args,
+                                    ref = True)
+            ref_logits = ref_output.logits[:, context_length - 1 : -1]
+            # Pad output sequence to response_length (necessary to avoid shape mismatch across devices)
+            # pad = torch.ones(ref_logits.shape[0], args.task.response_length-ref_logits.shape[1], dtype = ref_logits.dtype).to(device)
+            # ref_logits = torch.cat([ref_logits, pad], dim = 1)
+            ref_logits /= (args.task.temperature + args.eps)
+            ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
+            ref_logprob = torch.gather(ref_all_logprob, 2, response_batch.unsqueeze(-1)).squeeze(-1)
 
-                # # Response Processing 2. run reward model on the truncated responses
-                # repeated_instructions = []
-                # for inst in instruction_batch:
-                #     repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
-                score, reward_breakdown, reward_breakdown_coeffs = get_reward(reward_model = reward_model, 
-                                input_ids = query_response_batch,
-                                tokenizer = tokenizer)
+            ref_logprob = torch.masked_fill(ref_logprob, logprob_mask_batch, 0)
+            del ref_output, ref_logits, ref_all_logprob
+            torch.cuda.empty_cache()
 
-                logprobs.append(logprob)
-                ref_logprobs.append(ref_logprob)
-                scores.append(score)
+            # # Response Processing 2. run reward model on the truncated responses
+            # repeated_instructions = []
+            # for inst in instruction_batch:
+            #     repeated_instructions.extend([inst] * args.rloo_k) # effectively torch.repeat_interleave
+            score, reward_breakdown, reward_breakdown_coeffs = get_reward(reward_model = reward_model, 
+                            input_ids = query_response_batch,
+                            tokenizer = tokenizer)
 
-                torch.cuda.empty_cache()
-
-            scores = torch.cat(scores, 0)
-            logprobs = torch.cat(logprobs, 0)
-            ref_logprobs = torch.cat(ref_logprobs, 0)
+            logprobs.append(logprob)
+            ref_logprobs.append(ref_logprob)
+            scores.append(score)
 
             torch.cuda.empty_cache()
 
-            # scale RM scores
-            scores = scores * args.task.reward_coef
-            assert scores.shape == torch.Size([queries.shape[0] * args.rloo_k]), f"scores.shape {scores.shape} does not match queries.shape {queries.shape} * args.rloo_k {args.rloo_k}"
+        scores = torch.cat(scores, 0)
+        logprobs = torch.cat(logprobs, 0)
+        ref_logprobs = torch.cat(ref_logprobs, 0)
 
-            # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id (doesn't exceed max len)
-            # responses not passing that filter will receive a low (fixed) score
-            # only query RM on responses that pass that filter
-            if args.swap_eos_token:
-                contain_eos_token = torch.any(response_tensor == chat_template_tokenizer.eos_token_id, dim=-1)
-            else:
-                contain_eos_token = torch.any(response_tensor == tokenizer.eos_token_id, dim=-1)
-            scores = torch.where(contain_eos_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
-            penalty_frac = 1 - (contain_eos_token.sum() / len(contain_eos_token))
+        torch.cuda.empty_cache()
 
-            # Calculate baselines
-            if args.rloo_k > 1:
-                # The shape of score is [batch_size * rloo_k]
-                per_prompt_scores = scores.reshape(-1, args.rloo_k)
-                per_prompt_logprobs = torch.sum(logprobs, axis = 1).reshape(-1, args.rloo_k)
-                per_prompt_ref_logprobs = torch.sum(ref_logprobs, axis = 1).reshape(-1, args.rloo_k)
-                per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
-                kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
-                score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
-                baselines = score_baseline - kl_ctl.value * kl_baseline
-                baselines = baselines.reshape(-1)
-            else:
-                baselines = torch.zeros_like(scores)
+        # scale RM scores
+        scores = scores * args.task.reward_coef
+        assert scores.shape == torch.Size([queries.shape[0] * args.rloo_k]), f"scores.shape {scores.shape} does not match queries.shape {queries.shape} * args.rloo_k {args.rloo_k}"
 
-            # 4. compute rewards
-            kl = logprobs - ref_logprobs # [batch_size, response_len]
-            non_score_reward = -kl_ctl.value * kl
-            rewards = non_score_reward.clone()
-            actual_start = torch.arange(rewards.size(0), device=rewards.device)
-            actual_end = sequence_length
-            rewards[[actual_start, actual_end]] += scores
-            writer.add_scalar("generation/seq_len_mean", sequence_length.to(torch.float32).mean().item(), update)
-            writer.add_scalar("generation/seq_len_std", sequence_length.to(torch.float32).std().item(), update)
-            writer.add_scalar("generation/seq_len_max", sequence_length.max().item(), update)
-            writer.add_scalar("generation/seq_len_min", sequence_length.min().item(), update)
+        # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id (doesn't exceed max len)
+        # responses not passing that filter will receive a low (fixed) score
+        # only query RM on responses that pass that filter
+        if args.swap_eos_token:
+            contain_eos_token = torch.any(response_tensor == chat_template_tokenizer.eos_token_id, dim=-1)
+        else:
+            contain_eos_token = torch.any(response_tensor == tokenizer.eos_token_id, dim=-1)
+        scores = torch.where(contain_eos_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
+        penalty_frac = 1 - (contain_eos_token.sum() / len(contain_eos_token))
 
-            # Log reward breakdowns to wandb
-            reward_breakdown_dict, reward_breakdown_coeffs_dict = parse_reward_breakdown_attributes(reward_breakdown = reward_breakdown, 
-                                                                                reward_breakdown_coeffs = reward_breakdown_coeffs)
-            if args.track:
-                for key in reward_breakdown_dict:
-                    writer.add_scalar(f"reward_breakdown/{key}", reward_breakdown_dict[key], update)
-                    writer.add_scalar(f"reward_breakdown_coeffs/{key}", reward_breakdown_coeffs_dict[key], update)
-            del reward_breakdown, reward_breakdown_coeffs, reward_breakdown_dict, reward_breakdown_coeffs_dict
+        # Calculate baselines
+        if args.rloo_k > 1:
+            # The shape of score is [batch_size * rloo_k]
+            per_prompt_scores = scores.reshape(-1, args.rloo_k)
+            per_prompt_logprobs = torch.sum(logprobs, axis = 1).reshape(-1, args.rloo_k)
+            per_prompt_ref_logprobs = torch.sum(ref_logprobs, axis = 1).reshape(-1, args.rloo_k)
+            per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
+            kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
+            score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
+            baselines = score_baseline - kl_ctl.value * kl_baseline
+            baselines = baselines.reshape(-1)
+        else:
+            baselines = torch.zeros_like(scores)
 
-            torch.cuda.empty_cache()
+        # 4. compute rewards
+        kl = logprobs - ref_logprobs # [batch_size, response_len]
+        non_score_reward = -kl_ctl.value * kl
+        rewards = non_score_reward.clone()
+        actual_start = torch.arange(rewards.size(0), device=rewards.device)
+        actual_end = sequence_length
+        rewards[[actual_start, actual_end]] += scores
+        writer.add_scalar("generation/seq_len_mean", sequence_length.to(torch.float32).mean().item(), update)
+        writer.add_scalar("generation/seq_len_std", sequence_length.to(torch.float32).std().item(), update)
+        writer.add_scalar("generation/seq_len_max", sequence_length.max().item(), update)
+        writer.add_scalar("generation/seq_len_min", sequence_length.min().item(), update)
+
+        # Log reward breakdowns to wandb
+        reward_breakdown_dict, reward_breakdown_coeffs_dict = parse_reward_breakdown_attributes(reward_breakdown = reward_breakdown, 
+                                                                            reward_breakdown_coeffs = reward_breakdown_coeffs)
+        if args.track:
+            for key in reward_breakdown_dict:
+                writer.add_scalar(f"reward_breakdown/{key}", reward_breakdown_dict[key], update)
+                writer.add_scalar(f"reward_breakdown_coeffs/{key}", reward_breakdown_coeffs_dict[key], update)
+        del reward_breakdown, reward_breakdown_coeffs, reward_breakdown_dict, reward_breakdown_coeffs_dict
+
+        torch.cuda.empty_cache()
 
         # center = 0.1 * torch.mean(torch.sum(non_score_reward, axis=1) + scores)
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
@@ -308,6 +306,8 @@ if __name__ == "__main__":
             context_length = args.task.query_length + args.task.chat_template_buffer_length
         else:
             context_length = args.task.query_length
+
+        print("Forward pass work done.")
         
         model.train()
         for ppo_epoch_idx in range(args.ppo.noptepochs):
@@ -449,6 +449,7 @@ if __name__ == "__main__":
                 if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
                     force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
 
+    print("Train phase complete.")
     # save model
     if args.output_dir:
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)

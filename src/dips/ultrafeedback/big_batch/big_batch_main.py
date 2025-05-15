@@ -135,7 +135,9 @@ if __name__ == "__main__":
     pprint(model_config)
     pprint(reward_model.config)
 
-    policy, optimizer, scheduler = initialize_policy_with_optimizer(args, model_config, grad_norm_logger)
+    policy, optimizer, scheduler = initialize_policy_with_optimizer(args = args, 
+                                                                    model_config = model_config, 
+                                                                    grad_norm_logger = grad_norm_logger)
     del optimizer, scheduler
 
     # ========= Data =========
@@ -255,9 +257,12 @@ if __name__ == "__main__":
             torch.save(logprob_mask, os.path.join(LORA_DIR, "output", "logprob_mask.pkl"))
             torch.save(queries, os.path.join(LORA_DIR, "output", "queries.pkl"))
             torch.save(sequence_length, os.path.join(LORA_DIR, "output", "sequence_length.pkl"))
-            torch.save(args, os.path.join(LORA_DIR, "output", "args.pkl"))
+            with open(os.path.join(LORA_DIR, "output", "args.pkl"), "wb") as f:
+                pkl.dump(args, f)
             torch.save(postprocessed_response, os.path.join(LORA_DIR, "output", "postprocessed_response.pkl"))
-            process = subprocess.Popen(["python", "src/dips/ultrafeedback/big_batch/train.py", 
+            process = subprocess.Popen(["accelerate", "launch", "--num_processes", "1",
+                                        "src/dips/ultrafeedback/big_batch/train.py", 
+                                        "--lora_dir", LORA_DIR,
                                         "--response_tensor_file", os.path.join(LORA_DIR, "output", "response_tensor.pkl"),
                                         "--query_response_tensor_file", os.path.join(LORA_DIR, "output", "query_response_tensor.pkl"),
                                         "--logprob_mask_file", os.path.join(LORA_DIR, "output", "logprob_mask.pkl"),
@@ -265,5 +270,12 @@ if __name__ == "__main__":
                                         "--queries_file", os.path.join(LORA_DIR, "output", "queries.pkl"),
                                         "--sequence_length_file", os.path.join(LORA_DIR, "output", "sequence_length.pkl"),
                                         "--args_file", os.path.join(LORA_DIR, "output", "args.pkl"),
-                                        "--postprocessed_response_file", os.path.join(LORA_DIR, "output", "postprocessed_response.pkl")])
+                                        "--postprocessed_response_file", os.path.join(LORA_DIR, "output", "postprocessed_response.pkl"),
+                                        "--update_num", str(update)])
             process.wait()
+
+            policy, _, _ = initialize_policy_with_optimizer(args, 
+                                                            model_config, 
+                                                            grad_norm_logger,
+                                                            load_from_checkpoint = True,
+                                                            lora_dir = args.output_dir)
