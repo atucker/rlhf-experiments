@@ -91,7 +91,8 @@ def generate_vllm(policy: AutoModelForCausalLM,
                   device: torch.device,
                   args: Args,
                   n_outputs_per_prompt: int = 1,
-                  save_dir: str = None
+                  save_dir: str = None,
+                  get_logprobs: bool = False
                  ) -> torch.Tensor:
     """
     Generates sequences using VLLM engine.
@@ -137,20 +138,23 @@ def generate_vllm(policy: AutoModelForCausalLM,
         # min_tokens=generation_config.min_new_tokens, # VLLM might not support min_tokens
         stop_token_ids=[tokenizer.eos_token_id] if tokenizer.eos_token_id else None,
         skip_special_tokens=False, # Keep special tokens like EOS
-        logprobs=None, # Not needed here; will compute later with `forward`
+        logprobs=None if not get_logprobs else 1, # Not needed here; will compute later with `forward`
     )
 
     # VLLM call
     vllm_outputs = llm_engine.generate(prompts, sampling_params, use_tqdm=True)
 
     all_output_sequences = []
+    all_logprobs = []
     # Re-tokenize prompts to get the exact input IDs VLLM used (more robust than assuming first N tokens match)
     prompt_token_ids_dict = tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=context_length)
     prompt_token_ids = prompt_token_ids_dict.input_ids
 
-    for i, request_output in enumerate(vllm_outputs):
+    for request_output in vllm_outputs:
         for completion in request_output.outputs:
             generated_token_ids = torch.tensor(completion.token_ids, device=device)
+            if get_logprobs:
+                generated_token_logprobs = torch.tensor(completion.logprobs, device=device)
 
             # If the generated token ids are shorter than the maximum length, pad to max length (match behavior of generate())
             if generated_token_ids.shape[0] < generation_config.max_new_tokens:
@@ -161,13 +165,25 @@ def generate_vllm(policy: AutoModelForCausalLM,
                     device=device
                 )
                 generated_token_ids = torch.cat([generated_token_ids, padding])
+                if get_logprobs:
+                    logprob_padding = torch.full(
+                        (generation_config.max_new_tokens - generated_token_logprobs.shape[0],),
+                        0.0,
+                        dtype=torch.float,
+                        device=device
+                    )
+                    generated_token_logprobs = torch.cat([generated_token_logprobs, logprob_padding])
 
             all_output_sequences.append(generated_token_ids)
+            if get_logprobs:
+                all_logprobs.append(generated_token_logprobs)
     
     if not all_output_sequences:
         # Handle case where VLLM returns no output
         return torch.empty((0, output_length), dtype=torch.long, device=device)
 
+    if get_logprobs:
+        all_logprobs = torch.stack(all_logprobs) # [batch_size * n_outputs_per_prompt, output_length]
     final_tensor = torch.stack(all_output_sequences) # [batch_size * n_outputs_per_prompt, output_length]
 
     if args.swap_eos_token:
@@ -193,7 +209,10 @@ def generate_vllm(policy: AutoModelForCausalLM,
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
     
-    return final_tensor
+    if get_logprobs:
+        return final_tensor, all_logprobs
+    else:
+        return final_tensor
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

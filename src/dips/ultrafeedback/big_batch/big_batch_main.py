@@ -2,16 +2,11 @@
 
 import os
 import time
-from dataclasses import asdict
-from types import SimpleNamespace
-from collections import defaultdict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import tyro
 import wandb
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 
 # Logging

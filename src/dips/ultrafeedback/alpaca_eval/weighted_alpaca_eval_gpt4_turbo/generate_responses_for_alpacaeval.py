@@ -1,3 +1,6 @@
+"""
+Note: This script isn't useful - I wrote this before I realized that AlpacaEval had its own prompts. Whoops!
+"""
 from vllm import LLM, SamplingParams
 from datasets import load_dataset
 from transformers import AutoTokenizer
