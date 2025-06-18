@@ -64,7 +64,7 @@ def initialize_policy_with_optimizer(args: Args,
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(param_subset, lr=args.lr, eps=args.eps)
 
-    print("Params being optimized:", [name for name, param in policy.named_parameters() if param.requires_grad])
+    # print("Params being optimized:", [name for name, param in policy.named_parameters() if param.requires_grad])
 
     scheduler = get_scheduler(
         args.scheduler,

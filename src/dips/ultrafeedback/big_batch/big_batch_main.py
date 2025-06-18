@@ -176,7 +176,7 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
 
-    for update in trange(1, args.ppo.num_updates + 1):
+    for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.batch_size
         with torch.no_grad():
             # ============ Gathering training samples ============
@@ -255,7 +255,7 @@ if __name__ == "__main__":
             with open(os.path.join(LORA_DIR, "output", "args.pkl"), "wb") as f:
                 pkl.dump(args, f)
             torch.save(postprocessed_response, os.path.join(LORA_DIR, "output", "postprocessed_response.pkl"))
-            process = subprocess.Popen(["accelerate", "launch", "--num_processes", "1",
+            process = subprocess.Popen([".venv/bin/accelerate", "launch", "--num_processes", "1",
                                         "src/dips/ultrafeedback/big_batch/train.py", 
                                         "--lora_dir", LORA_DIR,
                                         "--response_tensor_file", os.path.join(LORA_DIR, "output", "response_tensor.pkl"),

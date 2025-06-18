@@ -13,7 +13,7 @@ import tyro
 import wandb
 from accelerate import Accelerator
 import accelerate
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
 
 # Logging
@@ -21,12 +21,10 @@ from rich.console import Console
 from rich.pretty import pprint
 
 # Model
-from transformers import (
-    AutoConfig,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    PreTrainedModel,
-)
+from transformers.models.auto.configuration_auto import AutoConfig
+from transformers.models.auto.modeling_auto import AutoModelForSequenceClassification
+from transformers.models.auto.tokenization_auto import AutoTokenizer
+from transformers.modeling_utils import PreTrainedModel
 
 # Package imports
 from dips.tldr.utils import set_seed
@@ -73,6 +71,7 @@ if __name__ == "__main__":
     with open(parsed_args.postprocessed_response_file, "rb") as f:
         postprocessed_response = torch.load(f)
     update = int(parsed_args.update_num)
+    print("Loaded all files.")
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps) 
 
@@ -176,8 +175,6 @@ if __name__ == "__main__":
     # ========= Main Training Loop =========
     start_time = time.time()
 
-    model.train()
-
     with torch.no_grad():
         # 3. Calculate the logprobs and ref_logprobs for the given responses
         logprobs = []
@@ -262,8 +259,8 @@ if __name__ == "__main__":
         if args.rloo_k > 1:
             # The shape of score is [batch_size * rloo_k]
             per_prompt_scores = scores.reshape(-1, args.rloo_k)
-            per_prompt_logprobs = torch.sum(logprobs, axis = 1).reshape(-1, args.rloo_k)
-            per_prompt_ref_logprobs = torch.sum(ref_logprobs, axis = 1).reshape(-1, args.rloo_k)
+            per_prompt_logprobs = torch.sum(logprobs, dim = 1).reshape(-1, args.rloo_k)
+            per_prompt_ref_logprobs = torch.sum(ref_logprobs, dim = 1).reshape(-1, args.rloo_k)
             per_prompt_approx_kl  = per_prompt_logprobs - per_prompt_ref_logprobs
             kl_baseline = (per_prompt_approx_kl.sum(dim = 1, keepdim = True) - per_prompt_approx_kl) / (args.rloo_k - 1)
             score_baseline = (per_prompt_scores.sum(dim = 1, keepdim = True) - per_prompt_scores) / (args.rloo_k - 1)
@@ -309,149 +306,149 @@ if __name__ == "__main__":
             context_length = args.task.query_length
 
         print("Forward pass work done.")
-        
-        model.train()
-        for ppo_epoch_idx in range(args.ppo.noptepochs):
-            local_batch_idxs = np.random.permutation(num_samples)
-            for mini_batch_start in range(0, num_samples, args.per_device_train_batch_size):
-                mini_batch_end = mini_batch_start + args.per_device_train_batch_size
-                mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
-                with accelerator.accumulate(model):
-                    # These are all fixed and won't get gradients
-                    mb_responses = response_tensor[mini_batch_inds] # [batch_size, response_len]
-                    mb_query_responses = query_response_tensor[mini_batch_inds] # [batch_size, seq_len]
-                    mb_postprocessed_responses = postprocessed_response[mini_batch_inds] # [batch_size, response_len]
-                    mb_logprobs = torch.sum(logprobs[mini_batch_inds], axis=1).detach() # [batch_size]
-                    mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], axis=1).detach()
-                    mb_reward = scores[mini_batch_inds]
-                    mb_baseline = baselines[mini_batch_inds]
+        # No grad context ends
 
-                    # compute the logprobs w/ gradient tracking
-                    output = forward(model = accelerator.unwrap_model(model), 
-                                     input_ids = mb_query_responses.clone().detach(), 
-                                     tokenizer = tokenizer,
-                                     args = args)
-                    print("Output:", output)
-                    # output.logits has shape [batch_size, seq_len, vocab_size]
-                    logits = output.logits[:, context_length - 1 : -1] # logits of response [batch_size, response_len, vocab_size]
-                    print("Logits:", logits.requires_grad, logits.grad_fn)
-                    # pad = torch.ones(logits.shape[0], args.task.response_length-logits.shape[1], logits.shape[2], dtype = logits.dtype).to(device)
-                    # logits = torch.cat([logits, pad], dim = 1)
-                    logits /= (args.task.temperature + args.eps)
-                    new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
+    model.train()
+    for ppo_epoch_idx in range(args.ppo.noptepochs):
+        local_batch_idxs = np.random.permutation(num_samples)
+        for mini_batch_start in trange(0, num_samples, args.per_device_train_batch_size):
+            mini_batch_end = mini_batch_start + args.per_device_train_batch_size
+            mini_batch_inds = local_batch_idxs[mini_batch_start:mini_batch_end]
+            with accelerator.accumulate(model):
+                # These are all fixed and won't get gradients
+                mb_responses = response_tensor[mini_batch_inds] # [batch_size, response_len]
+                mb_query_responses = query_response_tensor[mini_batch_inds] # [batch_size, seq_len]
+                mb_postprocessed_responses = postprocessed_response[mini_batch_inds] # [batch_size, response_len]
+                mb_logprobs = torch.sum(logprobs[mini_batch_inds], dim=1).detach() # [batch_size]
+                mb_ref_logprobs = torch.sum(ref_logprobs[mini_batch_inds], dim=1).detach()
+                mb_reward = scores[mini_batch_inds]
+                mb_baseline = baselines[mini_batch_inds]
 
-                    if args.swap_eos_token:
-                        logprob_mask = mb_postprocessed_responses == chat_template_tokenizer.eos_token_id
-                    else:
-                        logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
-                    mb_responses_no_padding = torch.masked_fill(mb_responses, logprob_mask, 0)
-                    # index logprobs over vocab dim by what the model actually generated
-                    new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses_no_padding.unsqueeze(-1)).squeeze(-1)
-                    # shape [batch_size] (total logprob of the response)
-                    new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
-                    new_logprobs = torch.sum(new_logprobs, axis=1)
-                    print("New logprobs:", new_logprobs.requires_grad, new_logprobs.grad_fn)
-                    with torch.amp.autocast(device_type = "cuda",
-                                            enabled = not args.loss_full_precision):
-                        if args.train_dips:
-                            # the IPS trick loss
-                            approx_kl = new_logprobs - mb_ref_logprobs
-                            prob_ratio = torch.exp(new_logprobs - mb_logprobs)
-                            weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                # compute the logprobs w/ gradient tracking
+                output = forward(model = accelerator.unwrap_model(model),
+                                    input_ids = mb_query_responses.clone().detach(), 
+                                    tokenizer = tokenizer,
+                                    args = args)
+                # output.logits has shape [batch_size, seq_len, vocab_size]
+                logits = output.logits[:, context_length - 1 : -1] # logits of response [batch_size, response_len, vocab_size]
+                # print("Logits:", logits.requires_grad, logits.grad_fn)
+                # pad = torch.ones(logits.shape[0], args.task.response_length-logits.shape[1], logits.shape[2], dtype = logits.dtype).to(device)
+                # logits = torch.cat([logits, pad], dim = 1)
+                logits /= (args.task.temperature + args.eps)
+                new_all_logprobs = F.log_softmax(logits, dim=-1) # [batch_size, response_len, vocab_size]
 
-                            if args.factor_loss:
-                                policy_loss_term = (prob_ratio * weighting.detach()).mean()
-                                kl_loss_term = (prob_ratio.detach() * weighting).mean()
-                                loss = -1 * (policy_loss_term + kl_loss_term)
-                            else:
-                                loss = torch.mean(-1 * prob_ratio * weighting)
-
-                        else:
-                            # RLOO loss
-                            approx_kl = mb_logprobs - mb_ref_logprobs
-                            weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
-                            loss = torch.mean(-1*new_logprobs * weighting)
-                            if args.kl_grad_patch:
-                                differentiable_kl = new_logprobs - mb_ref_logprobs
-                                diff_reward = (mb_reward - mb_baseline - kl_ctl.value * differentiable_kl)
-                                loss = loss + torch.mean(-1 * diff_reward)
-
-                    # Grab model grad norms
-                    # if args.train_dips and args.factor_loss:
-                    #     policy_term_grad_norms = grad_norm_logger.get_grad_norms(loss = policy_loss_term)
-                    #     kl_term_grad_norms = grad_norm_logger.get_grad_norms(loss = kl_loss_term)
-
-                    # grad_norms = grad_norm_logger.get_grad_norms(loss = loss)
-
-                    accelerator.backward(loss)
-                    if args.clip_grad_norm is not None and accelerator.sync_gradients:
-                        accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                with torch.no_grad():
-                    # Do whatever logging we want
-                    metrics["loss"][ppo_epoch_idx] += loss.detach().mean()
-                    metrics["baseline"][ppo_epoch_idx] += mb_baseline.mean()
-                    # metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
-                    # metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
-                    # metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
-                    metrics["penalty_frac"][ppo_epoch_idx] += penalty_frac.mean().item()
-
+                if args.swap_eos_token:
+                    logprob_mask = mb_postprocessed_responses == chat_template_tokenizer.eos_token_id
+                else:
+                    logprob_mask = mb_postprocessed_responses == tokenizer.pad_token_id
+                mb_responses_no_padding = torch.masked_fill(mb_responses, logprob_mask, 0)
+                # index logprobs over vocab dim by what the model actually generated
+                new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses_no_padding.unsqueeze(-1)).squeeze(-1)
+                # shape [batch_size] (total logprob of the response)
+                new_logprobs = torch.masked_fill(new_logprobs, logprob_mask, 0)
+                new_logprobs = torch.sum(new_logprobs, dim=1)
+                # print("New logprobs:", new_logprobs.requires_grad, new_logprobs.grad_fn)
+                with torch.amp.autocast(device_type = "cuda",
+                                        enabled = not args.loss_full_precision):
                     if args.train_dips:
-                        metrics["weighting"][ppo_epoch_idx] += weighting.mean()
-                        metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
-                        metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
-                        # if args.factor_loss:
-                        #     # No need to log kl and policy grad norms - they're both the same as the loss.
-                        #     # The distinction is in the gradient flow.
-                        #     metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
-                        #     metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
-                        #     metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
-                        #     metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
-                        #     metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
-                        #     metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
+                        # the IPS trick loss
+                        approx_kl = new_logprobs - mb_ref_logprobs
+                        prob_ratio = torch.exp(new_logprobs - mb_logprobs)
+                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+
+                        if args.factor_loss:
+                            policy_loss_term = (prob_ratio * weighting.detach()).mean()
+                            kl_loss_term = (prob_ratio.detach() * weighting).mean()
+                            loss = -1 * (policy_loss_term + kl_loss_term)
+                        else:
+                            loss = torch.mean(-1 * prob_ratio * weighting)
+
                     else:
-                        metrics["weighting"][ppo_epoch_idx] += weighting.mean()
-                        metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
-                        metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+                        # RLOO loss
+                        approx_kl = mb_logprobs - mb_ref_logprobs
+                        weighting = (mb_reward - mb_baseline - kl_ctl.value * approx_kl)
+                        loss = torch.mean(-1*new_logprobs * weighting)
+                        if args.kl_grad_patch:
+                            differentiable_kl = new_logprobs - mb_ref_logprobs
+                            diff_reward = (mb_reward - mb_baseline - kl_ctl.value * differentiable_kl)
+                            loss = loss + torch.mean(-1 * diff_reward)
 
-                    
-        with torch.no_grad():
-            mean_kl = kl.sum(1).mean()
-            mean_entropy = (-logprobs).sum(1).mean()
-            mean_non_score_reward = non_score_reward.sum(1).mean()
+                # Grab model grad norms
+                # if args.train_dips and args.factor_loss:
+                #     policy_term_grad_norms = grad_norm_logger.get_grad_norms(loss = policy_loss_term)
+                #     kl_term_grad_norms = grad_norm_logger.get_grad_norms(loss = kl_loss_term)
 
-            writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
-            writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
-            writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
-            writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
-            writer.add_scalar(
-                "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
-            )
-            writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
+                # grad_norms = grad_norm_logger.get_grad_norms(loss = loss)
 
-            writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
-            writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
-            writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
+                accelerator.backward(loss)
+                if args.clip_grad_norm is not None and accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
 
-            for stats in metrics:
-                writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
+                optimizer.step()
+                optimizer.zero_grad()
 
-            scheduler.step()
-            writer.add_scalar("train/lr", scheduler.get_last_lr()[0], update)
+            with torch.no_grad():
+                # Do whatever logging we want
+                metrics["loss"][ppo_epoch_idx] += loss.detach().mean()
+                metrics["baseline"][ppo_epoch_idx] += mb_baseline.mean()
+                # metrics["grad_norm_mean"][ppo_epoch_idx] += grad_norms.mean()
+                # metrics["grad_norm_max"][ppo_epoch_idx] += grad_norms.max()
+                # metrics["grad_norm_std"][ppo_epoch_idx] += grad_norms.std()
+                metrics["penalty_frac"][ppo_epoch_idx] += penalty_frac.mean().item()
 
-            if args.reward.use_adaptive_kl:
-                kl_ctl.update(mean_kl.item(), args.batch_size)
-            
-            del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss #, grad_norms
-            del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
+                if args.train_dips:
+                    metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                    metrics["prob_ratio"][ppo_epoch_idx] += prob_ratio.mean()
+                    metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
+                    # if args.factor_loss:
+                    #     # No need to log kl and policy grad norms - they're both the same as the loss.
+                    #     # The distinction is in the gradient flow.
+                    #     metrics["policy_grad_norm_mean"][ppo_epoch_idx] += policy_term_grad_norms.mean()
+                    #     metrics["policy_grad_norm_max"][ppo_epoch_idx] += policy_term_grad_norms.max()
+                    #     metrics["policy_grad_norm_std"][ppo_epoch_idx] += policy_term_grad_norms.std()
+                    #     metrics["kl_grad_norm_mean"][ppo_epoch_idx] += kl_term_grad_norms.mean()
+                    #     metrics["kl_grad_norm_max"][ppo_epoch_idx] += kl_term_grad_norms.max()
+                    #     metrics["kl_grad_norm_std"][ppo_epoch_idx] += kl_term_grad_norms.std()
+                else:
+                    metrics["weighting"][ppo_epoch_idx] += weighting.mean()
+                    metrics["new_logprobs"][ppo_epoch_idx] += new_logprobs.mean()
+                    metrics["approx_kl"][ppo_epoch_idx] += approx_kl.mean()
 
-            torch.cuda.empty_cache()
-            if args.force_clear_grad_optim:
-                if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
-                    force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
+                
+    with torch.no_grad():
+        mean_kl = kl.sum(1).mean()
+        mean_entropy = (-logprobs).sum(1).mean()
+        mean_non_score_reward = non_score_reward.sum(1).mean()
+
+        writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
+        writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
+        writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
+        writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
+        writer.add_scalar(
+            "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
+        )
+        writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
+
+        writer.add_scalar("train/reward", accelerator.gather(scores.mean()).mean().item(), update)
+        writer.add_scalar("train/reward_std", accelerator.gather(scores).std().item(), update)
+        writer.add_scalar("train/kl", accelerator.gather(mean_kl).mean().item(), update)
+
+        for stats in metrics:
+            writer.add_scalar(f"train/{stats}", accelerator.gather(metrics[stats]).mean().item() / num_minibatches, update)
+
+        scheduler.step()
+        writer.add_scalar("train/lr", scheduler.get_last_lr()[0], update)
+
+        if args.reward.use_adaptive_kl:
+            kl_ctl.update(mean_kl.item(), args.batch_size)
+        
+        del output, logits, new_all_logprobs, new_logprobs, approx_kl, weighting, loss #, grad_norms
+        del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
+
+        torch.cuda.empty_cache()
+        if args.force_clear_grad_optim:
+            if (args.local_rollout_forward_batch_size * args.rloo_k) % (args.gradient_accumulation_steps * args.per_device_train_batch_size * args.world_size) == 0:
+                force_clear_grads(accelerator, model, optimizer) # Note: We want to pass in the model instead of accelerator.unwrap(model) to access the _no_sync_context.
 
     print("Train phase complete.")
     # save model
