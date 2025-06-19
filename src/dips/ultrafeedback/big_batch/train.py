@@ -105,12 +105,9 @@ if __name__ == "__main__":
     if args.train_dips:
         final_exp_name = f"{args.exp_name}_dips"
         algo_subdir = "dips"
-        final_output_dir = os.path.join(args.output_dir, algo_subdir)
     else:
         final_exp_name = f"{args.exp_name}_rloo"
         algo_subdir = "rloo"
-        final_output_dir = os.path.join(args.output_dir, algo_subdir)
-    os.makedirs(final_output_dir, exist_ok=True)
 
     run_name = f"{final_exp_name}__{args.seed}__{algo_subdir}"
 

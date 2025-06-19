@@ -193,7 +193,6 @@ def generate_vllm(policy: AutoModelForCausalLM,
                                       to_token = "<|eot_id|>")
          
     # ======= Memory Cleanup =======
-    llm_engine.destroy_model_parallel_ranks()
     # Explicitly destroy the process group if it was initialized
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
