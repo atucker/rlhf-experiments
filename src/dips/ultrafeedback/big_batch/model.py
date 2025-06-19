@@ -39,18 +39,17 @@ def initialize_policy_with_optimizer(args: Args,
     for param in policy.parameters():
         param.requires_grad = False
 
-    peft_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-    )
     if load_from_checkpoint:
         policy = PeftModel.from_pretrained(policy, 
                                            lora_dir, 
-                                           config = peft_config,
                                            is_trainable = True)
     else:
+        peft_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+        )
         policy = get_peft_model(policy, peft_config=peft_config)
 
     param_subset = [param for param in policy.parameters() if param.requires_grad]

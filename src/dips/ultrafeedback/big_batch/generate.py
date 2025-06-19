@@ -193,6 +193,11 @@ def generate_vllm(policy: AutoModelForCausalLM,
                                       to_token = "<|eot_id|>")
          
     # ======= Memory Cleanup =======
+    llm_engine.destroy_model_parallel_ranks()
+    # Explicitly destroy the process group if it was initialized
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+        
     del llm_engine
     del vllm_outputs
     del all_output_sequences
@@ -204,10 +209,6 @@ def generate_vllm(policy: AutoModelForCausalLM,
         # Create the save directory if it doesn't exist
         os.makedirs(save_dir, exist_ok=True)
         torch.save(final_tensor, os.path.join(save_dir, "responses.pkl"))
-
-    # Explicitly destroy the process group if it was initialized
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
     
     if get_logprobs:
         return final_tensor, all_logprobs
